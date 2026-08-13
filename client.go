@@ -3,9 +3,11 @@ package magicws
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"errors"
 	"io"
 	"net"
+	"net/url"
 	"sync"
 
 	"github.com/gobwas/ws"
@@ -18,12 +20,19 @@ type Client struct {
 	onClose   func()
 	isClosed  bool
 	mu        sync.RWMutex
+	tlsConfig *tls.Config
 }
 
 func NewClient() *Client {
 	return &Client{
 		sendChan: make(chan []byte, 256),
 	}
+}
+
+func (c *Client) SetTLSConfig(cfg *tls.Config) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.tlsConfig = cfg
 }
 
 func (c *Client) OnMessage(fn func(data []byte)) {
@@ -34,8 +43,31 @@ func (c *Client) OnClose(fn func()) {
 	c.onClose = fn
 }
 
-func (c *Client) Connect(ctx context.Context, url string) error {
-	conn, _, _, err := ws.Dial(ctx, url)
+func (c *Client) Connect(ctx context.Context, rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return err
+	}
+
+	c.mu.RLock()
+	userTLSConfig := c.tlsConfig
+	c.mu.RUnlock()
+
+	dialer := ws.Dialer{}
+
+	if u.Scheme == "wss" {
+		if userTLSConfig != nil {
+			dialer.TLSConfig = userTLSConfig
+		} else {
+			dialer.TLSConfig = &tls.Config{
+				ServerName: u.Hostname(),
+			}
+		}
+	} else if userTLSConfig != nil {
+		dialer.TLSConfig = userTLSConfig
+	}
+
+	conn, _, _, err := dialer.Dial(ctx, rawURL)
 	if err != nil {
 		return err
 	}

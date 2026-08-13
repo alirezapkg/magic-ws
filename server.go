@@ -2,7 +2,9 @@ package magicws
 
 import (
 	"bufio"
+	"crypto/tls"
 	"io"
+	"net"
 	"net/http"
 
 	"github.com/gobwas/ws"
@@ -32,6 +34,22 @@ func (s *Server) OnDisconnect(fn func(u *User)) {
 
 func (s *Server) OnMessage(fn func(u *User, data []byte)) {
 	s.onMessage = fn
+}
+
+func (s *Server) ListenAndServe(addr string) error {
+	return http.ListenAndServe(addr, http.HandlerFunc(s.HandleWS))
+}
+
+func (s *Server) ListenAndServeTLS(addr, certFile, keyFile string) error {
+	return http.ListenAndServeTLS(addr, certFile, keyFile, http.HandlerFunc(s.HandleWS))
+}
+
+func (s *Server) ServeTLS(l net.Listener, certConfig *tls.Config) error {
+	server := &http.Server{
+		Handler:   http.HandlerFunc(s.HandleWS),
+		TLSConfig: certConfig,
+	}
+	return server.ServeTLS(l, "", "")
 }
 
 func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
