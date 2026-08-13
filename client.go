@@ -73,7 +73,7 @@ func (c *Client) Connect(ctx context.Context, rawURL string) error {
 	}
 	c.conn = conn
 
-	frame := ws.NewTextFrame([]byte(ProtocolVersion))
+	frame := ws.NewBinaryFrame([]byte{ProtocolVersion})
 	frame = ws.MaskFrameInPlace(frame)
 
 	if err := ws.WriteFrame(c.conn, frame); err != nil {

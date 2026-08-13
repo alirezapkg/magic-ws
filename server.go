@@ -90,7 +90,7 @@ func (s *Server) handleConnection(u *User) {
 		ws.Cipher(payload, header.Mask, 0)
 	}
 
-	if string(payload) != ProtocolVersion {
+	if len(payload) == 0 || payload[0] != ProtocolVersion {
 		PutBuffer(buf)
 		u.Close()
 		return

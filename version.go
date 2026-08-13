@@ -1,3 +1,3 @@
 package magicws
 
-const ProtocolVersion = "1"
+const ProtocolVersion byte = 1
