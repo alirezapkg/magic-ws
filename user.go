@@ -2,10 +2,10 @@ package magicws
 
 import (
 	"net"
-	"sync"
+	"sync/atomic"
 )
 
-type UserState int
+type UserState int32
 
 const (
 	StatePending UserState = iota
@@ -16,67 +16,53 @@ const (
 type User struct {
 	ID       string
 	conn     net.Conn
-	state    UserState
-	roomID   string
+	state    int32
+	roomID   uint32
 	sendChan chan []byte
-	mu       sync.RWMutex
 }
 
 func NewUser(id string, conn net.Conn) *User {
 	return &User{
 		ID:       id,
 		conn:     conn,
-		state:    StatePending,
+		state:    int32(StatePending),
 		sendChan: make(chan []byte, 256),
 	}
 }
 
-func (u *User) Send(data []byte) {
-	u.mu.RLock()
-	defer u.mu.RUnlock()
+func (u *User) GetState() UserState {
+	return UserState(atomic.LoadInt32(&u.state))
+}
 
-	if u.state != StateConnected {
+func (u *User) SetState(state UserState) {
+	atomic.StoreInt32(&u.state, int32(state))
+}
+
+func (u *User) GetRoom() uint32 {
+	return atomic.LoadUint32(&u.roomID)
+}
+
+func (u *User) SetRoom(roomID uint32) {
+	atomic.StoreUint32(&u.roomID, roomID)
+}
+
+func (u *User) Send(data []byte) {
+	if u.GetState() != StateConnected {
 		return
 	}
 
 	select {
 	case u.sendChan <- data:
 	default:
+		// Drop packet on channel full
 	}
-}
-
-func (u *User) SetRoom(roomID string) {
-	u.mu.Lock()
-	u.roomID = roomID
-	u.mu.Unlock()
-}
-
-func (u *User) GetRoom() string {
-	u.mu.RLock()
-	defer u.mu.RUnlock()
-	return u.roomID
-}
-
-func (u *User) LeaveRoom() {
-	u.SetRoom("")
-}
-
-func (u *User) GetState() UserState {
-	u.mu.RLock()
-	defer u.mu.RUnlock()
-	return u.state
 }
 
 func (u *User) Close() {
-	u.mu.Lock()
-	if u.state == StateDisconnected {
-		u.mu.Unlock()
-		return
-	}
-	u.state = StateDisconnected
-	u.mu.Unlock()
-
-	if u.conn != nil {
-		u.conn.Close()
+	if atomic.CompareAndSwapInt32(&u.state, int32(StateConnected), int32(StateDisconnected)) ||
+		atomic.CompareAndSwapInt32(&u.state, int32(StatePending), int32(StateDisconnected)) {
+		if u.conn != nil {
+			_ = u.conn.Close()
+		}
 	}
 }

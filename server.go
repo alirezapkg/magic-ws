@@ -1,6 +1,7 @@
 package magicws
 
 import (
+	"bufio"
 	"io"
 	"net/http"
 
@@ -52,16 +53,16 @@ func (s *Server) handleConnection(u *User) {
 	}()
 
 	buf := GetBuffer()
-	defer PutBuffer(buf)
-
 	header, err := ws.ReadHeader(u.conn)
 	if err != nil {
+		PutBuffer(buf)
 		u.Close()
 		return
 	}
 
 	_, err = io.CopyN(buf, u.conn, header.Length)
 	if err != nil {
+		PutBuffer(buf)
 		u.Close()
 		return
 	}
@@ -72,11 +73,13 @@ func (s *Server) handleConnection(u *User) {
 	}
 
 	if string(payload) != ProtocolVersion {
+		PutBuffer(buf)
 		u.Close()
 		return
 	}
+	PutBuffer(buf)
 
-	u.state = StateConnected
+	u.SetState(StateConnected)
 	s.Users.Add(u)
 
 	if s.onConnect != nil {
@@ -84,13 +87,33 @@ func (s *Server) handleConnection(u *User) {
 	}
 
 	go func() {
+		bw := bufio.NewWriterSize(u.conn, 1024)
 		for data := range u.sendChan {
-			frame := ws.NewBinaryFrame(data)
-			if err := ws.WriteFrame(u.conn, frame); err != nil {
+			hdr := ws.Header{
+				Fin:    true,
+				OpCode: ws.OpBinary,
+				Length: int64(len(data)),
+			}
+
+			if err := ws.WriteHeader(bw, hdr); err != nil {
 				break
+			}
+			if len(data) > 0 {
+				if _, err := bw.Write(data); err != nil {
+					break
+				}
+			}
+
+			if len(u.sendChan) == 0 {
+				if err := bw.Flush(); err != nil {
+					break
+				}
 			}
 		}
 	}()
+
+	readBuf := GetBuffer()
+	defer PutBuffer(readBuf)
 
 	for {
 		header, err := ws.ReadHeader(u.conn)
@@ -98,16 +121,16 @@ func (s *Server) handleConnection(u *User) {
 			break
 		}
 
-		buf.Reset()
+		readBuf.Reset()
 
 		if header.Length > 0 {
-			_, err = io.CopyN(buf, u.conn, header.Length)
+			_, err = io.CopyN(readBuf, u.conn, header.Length)
 			if err != nil {
 				break
 			}
 		}
 
-		payload := buf.Bytes()
+		payload := readBuf.Bytes()
 		if header.Masked {
 			ws.Cipher(payload, header.Mask, 0)
 		}

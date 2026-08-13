@@ -29,15 +29,15 @@ func main() {
 	var roomCounter uint64
 
 	server.OnConnect(func(u *magicws.User) {
-		rID := atomic.AddUint64(&roomCounter, 1) % TotalRooms
-		u.SetRoom(fmt.Sprintf("room_%d", rID))
+		rID := uint32((atomic.AddUint64(&roomCounter, 1) % TotalRooms) + 1)
+		server.Users.SetUserRoom(u, rID)
 	})
 
 	server.OnMessage(func(u *magicws.User, data []byte) {
 		atomic.AddUint64(&totalReceived, 1)
 
 		roomID := u.GetRoom()
-		if roomID != "" {
+		if roomID != 0 {
 			server.Users.SendToRoom(roomID, data)
 		}
 	})

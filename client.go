@@ -1,6 +1,7 @@
 package magicws
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"io"
@@ -65,7 +66,6 @@ func (c *Client) Send(data []byte) {
 	select {
 	case c.sendChan <- data:
 	default:
-		// Drop packet on channel buffer full
 	}
 }
 
@@ -115,12 +115,20 @@ func (c *Client) readLoop() {
 }
 
 func (c *Client) writeLoop() {
+	bw := bufio.NewWriterSize(c.conn, 1024)
+
 	for data := range c.sendChan {
 		frame := ws.NewBinaryFrame(data)
 		frame = ws.MaskFrameInPlace(frame)
 
-		if err := ws.WriteFrame(c.conn, frame); err != nil {
+		if err := ws.WriteFrame(bw, frame); err != nil {
 			break
+		}
+
+		if len(c.sendChan) == 0 {
+			if err := bw.Flush(); err != nil {
+				break
+			}
 		}
 	}
 }
