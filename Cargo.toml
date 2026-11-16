@@ -1,0 +1,79 @@
+[package]
+name = "magic-ws"
+version = "1.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/alirezapkg/magic-ws"
+authors = ["ali reza"]
+description = "Lightweight binary WebSocket framework for real-time games"
+readme = "README.md"
+keywords = ["websocket", "game", "binary", "realtime", "networking"]
+categories = ["network-programming", "game-development"]
+documentation = "https://docs.rs/magic-ws"
+homepage = "https://github.com/alirezapkg/magic-ws"
+
+# Ship only the crate: sources, examples, tests and the licence.
+include = [
+    "src/**/*",
+    "examples/**/*",
+    "tests/**/*",
+    "LICENSE",
+    "README.md",
+]
+
+[dependencies]
+futures-util = { version = "0.3.34", default-features = false, features = ["sink"] }
+http = { version = "1.5.0", default-features = false }
+parking_lot = { version = "0.12.5", default-features = false }
+thiserror = { version = "2.0.21", default-features = false }
+tokio = { version = "1.54.1", default-features = false, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio-tungstenite = { version = "0.23.1", default-features = false, features = ["handshake", "stream"] }
+tracing = { version = "0.1.44", default-features = false }
+
+# Optional: only needed so `install_crypto_provider` can select `ring` when
+# the `tls` feature is on. `tungstenite` builds rustls without a default
+# provider, which would make rustls panic at runtime.
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+ring = { version = "0.17.14", default-features = false, optional = true }
+
+[features]
+default = ["tls"]
+## Enables `wss://` client support backed by rustls + webpki roots.
+tls = [
+    "dep:ring",
+    "dep:rustls",
+    "tokio-tungstenite/rustls-tls-webpki-roots",
+]
+
+[dev-dependencies]
+tokio = { version = "1.54.1", features = ["full"] }
+tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
+clap = { version = "4.6.7", default-features = false, features = ["derive", "std", "help", "usage"] }
+tokio-rustls = { version = "0.26.6", default-features = false }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "1.0.4"
+rustls-pki-types = "1.16.0"
+
+[[example]]
+name = "test_server"
+path = "examples/test_server.rs"
+
+[[example]]
+name = "tls_test"
+path = "examples/tls_test.rs"
+
+[[example]]
+name = "basic"
+path = "examples/basic.rs"
+
+[[example]]
+name = "events_benchmark"
+path = "examples/events_benchmark.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
