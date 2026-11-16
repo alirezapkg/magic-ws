@@ -21,6 +21,20 @@ an opaque payload. No JSON, no base64, no per-message type tags.
 - **Wire-compatible** with the existing Unity client and the original Go
   server. Same handshake, same framing, same event hashes.
 
+## Clients
+
+The Rust crate ships both a server and a client. Other platforms speak the
+same protocol:
+
+| Client | Repository |
+|---|---|
+| Unity (C#) | [com.alirezapkg.magicws](https://github.com/alirezapkg/com.alirezapkg.magicws) |
+| Rust | this crate |
+
+A Unity project and a MagicWS server interoperate without any translation
+layer: same `0x01` version byte, same `[u32 BE event id][payload]` framing, and
+the same FNV-1a event ids. See [Protocol](#protocol) for the details.
+
 ## Install
 
 ```bash
@@ -319,6 +333,9 @@ let custom = Event::from_parts(0xdead_beef, "my_event");
 | Version byte | `0x01` | `0x01` | `0x01` |
 | Frame | `[u32 BE][payload]` | same | same |
 | Hash | FNV-1a 32 | same | same |
+
+The Unity client lives in
+[com.alirezapkg.magicws](https://github.com/alirezapkg/com.alirezapkg.magicws).
 
 ## Performance
 
