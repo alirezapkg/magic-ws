@@ -1,7 +1,7 @@
 //! Users and rooms.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
@@ -52,6 +52,7 @@ pub struct User {
 #[derive(Debug)]
 struct Inner {
     id: String,
+    player_id: OnceLock<String>,
     addr: std::net::SocketAddr,
     state: AtomicU8,
     room: AtomicU32,
@@ -67,6 +68,7 @@ impl User {
         Self {
             inner: Arc::new(Inner {
                 id,
+                player_id: OnceLock::new(),
                 addr,
                 state: AtomicU8::new(UserState::Pending as u8),
                 room: AtomicU32::new(0),
@@ -86,6 +88,31 @@ impl User {
     #[must_use]
     pub fn id(&self) -> &str {
         &self.inner.id
+    }
+
+    /// Sets a stable player id for this connection.
+    ///
+    /// Returns `true` when the id was stored, `false` when one was already
+    /// set. The id is application-assigned (for example a session token or a
+    /// database id) and stays constant across reconnects, unlike
+    /// [`User::id`] which is derived from the socket address.
+    pub fn set_player_id(&self, id: &str) -> bool {
+        if self.inner.player_id.set(id.to_string()).is_err() {
+            return false;
+        }
+        // If this user is already registered, expose the new id through the
+        // registry's secondary index.
+        let hub = self.inner.hub.lock().as_ref().and_then(Weak::upgrade);
+        if let Some(hub) = hub {
+            hub.index_player_id(self);
+        }
+        true
+    }
+
+    /// Returns the stable player id, if one was set.
+    #[must_use]
+    pub fn player_id(&self) -> Option<&str> {
+        self.inner.player_id.get().map(String::as_str)
     }
 
     /// Returns the remote address of this user.

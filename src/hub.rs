@@ -21,6 +21,9 @@ pub struct UserManager {
 #[derive(Debug, Default)]
 pub(crate) struct HubInner {
     pub(crate) users: RwLock<HashMap<String, User>>,
+    /// Secondary index keyed by the application-assigned player id. Only users
+    /// that called [`User::set_player_id`] appear here.
+    pub(crate) player_ids: RwLock<HashMap<String, User>>,
     /// Per-room queues of users. A queue preserves insertion order and lets
     /// removal be O(1) on average instead of O(n) per call.
     pub(crate) rooms: RwLock<HashMap<RoomId, VecDeque<User>>>,
@@ -69,6 +72,20 @@ impl HubInner {
             entry.remove();
         }
     }
+
+    /// Indexes `user` under its player id, if it has one.
+    ///
+    /// Called from [`User::set_player_id`] so ids assigned after the user was
+    /// added (for example in `on_connect`) are reachable through
+    /// [`UserManager::get_by_player_id`].
+    pub(crate) fn index_player_id(&self, user: &User) {
+        if let Some(player_id) = user.player_id() {
+            self.player_ids
+                .write()
+                .unwrap()
+                .insert(player_id.to_string(), user.clone());
+        }
+    }
 }
 
 impl Default for UserManager {
@@ -89,9 +106,17 @@ impl UserManager {
     /// Registers `user` and returns the handle that was stored.
     ///
     /// The user is linked back to this registry, so later room changes through
-    /// [`User::set_room`] keep the room index up to date.
+    /// [`User::set_room`] keep the room index up to date. If the user already
+    /// carries a player id it is indexed too.
     pub fn add(&self, user: User) -> User {
         user.attach_hub(&self.inner);
+        if let Some(player_id) = user.player_id() {
+            self.inner
+                .player_ids
+                .write()
+                .unwrap()
+                .insert(player_id.to_string(), user.clone());
+        }
         self.inner
             .users
             .write()
@@ -106,6 +131,14 @@ impl UserManager {
         self.inner.users.read().unwrap().get(id).cloned()
     }
 
+    /// Looks a user up by its application-assigned player id.
+    ///
+    /// Only users that called [`User::set_player_id`] are indexed.
+    #[must_use]
+    pub fn get_by_player_id(&self, id: &str) -> Option<User> {
+        self.inner.player_ids.read().unwrap().get(id).cloned()
+    }
+
     /// Removes `id` from the registry and from its room.
     ///
     /// Returns the removed user, if any.
@@ -113,12 +146,23 @@ impl UserManager {
         let removed = self.inner.users.write().unwrap().remove(id)?;
         removed.close();
 
+        if let Some(player_id) = removed.player_id() {
+            self.inner.player_ids.write().unwrap().remove(player_id);
+        }
         if let Some(room) = removed.room() {
             self.inner.remove_from_room(&removed, room);
         }
         removed.store_room(None);
 
         Some(removed)
+    }
+
+    /// Removes the user identified by its application-assigned player id.
+    ///
+    /// The connection is closed. Returns the removed user, if any.
+    pub fn remove_by_player_id(&self, id: &str) -> Option<User> {
+        let user = self.get_by_player_id(id)?;
+        self.remove(user.id())
     }
 
     /// Moves `user` to `room`, leaving its previous room first.
@@ -351,5 +395,43 @@ mod tests {
 
         assert_eq!(manager.broadcast(b"x"), 1);
         assert_eq!(rx.recv().await, Some(b"x".to_vec()));
+    }
+
+    #[test]
+    fn player_id_lookup_and_removal() {
+        let manager = UserManager::new();
+        let user = manager.add(connected("a"));
+
+        assert!(user.set_player_id("player:123"));
+        assert_eq!(
+            manager
+                .get_by_player_id("player:123")
+                .map(|u| u.id().to_string()),
+            Some("a".into())
+        );
+
+        // Second set is rejected and keeps the first value.
+        assert!(!user.set_player_id("player:456"));
+        assert_eq!(user.player_id(), Some("player:123"));
+        assert!(manager.get_by_player_id("player:456").is_none());
+
+        // Removing by player id drops the connection and both indexes.
+        let removed = manager.remove_by_player_id("player:123");
+        assert_eq!(removed.map(|u| u.id().to_string()), Some("a".into()));
+        assert!(manager.get_by_player_id("player:123").is_none());
+        assert!(manager.get("a").is_none());
+        assert!(user.is_closed());
+    }
+
+    #[tokio::test]
+    async fn player_id_survives_reindex_on_add() {
+        // A user that already carries a player id is indexed on add.
+        let manager = UserManager::new();
+        let (tx, _rx) = crate::user::channel();
+        let user = User::new("a".into(), "127.0.0.1:1".parse().unwrap(), tx);
+        user.set_player_id("p:1");
+        let user = manager.add(user);
+        assert!(manager.get_by_player_id("p:1").is_some());
+        assert_eq!(user.player_id(), Some("p:1"));
     }
 }

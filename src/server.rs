@@ -410,6 +410,13 @@ impl Server {
         self.0.users.remove(user.id());
     }
 
+    /// Disconnects the user with the given application-assigned player id.
+    ///
+    /// Returns `true` when a matching user was found and disconnected.
+    pub fn disconnect_by_player_id(&self, id: &str) -> bool {
+        self.0.users.remove_by_player_id(id).is_some()
+    }
+
     /// Queues `msg` for `user`.
     ///
     /// Returns `false` when the user is gone or its queue is full.
