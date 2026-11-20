@@ -45,7 +45,7 @@ Or add it by hand:
 
 ```toml
 [dependencies]
-magic-ws = "1.1"
+magic-ws = "1.2"
 tokio = { version = "1", features = ["full"] }
 ```
 
