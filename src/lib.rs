@@ -73,7 +73,7 @@ pub use event::{fnv1a, hash_name, Event};
 pub use events::{
     ClientEvents, ClientHandler, MessageHandler, RoomEmit, ServerEvents, UserEventHandler,
 };
-pub use hub::UserManager;
+pub use hub::{JoinError, UserManager};
 pub use protocol::{
     is_version_packet, pack_message, unpack_message, version_packet, EventId, HEADER_LEN,
     PROTOCOL_VERSION, READ_BUF_SIZE, SEND_QUEUE, WRITE_BUF_SIZE,

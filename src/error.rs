@@ -44,6 +44,10 @@ pub enum Error {
     /// The server has been shut down.
     #[error("server stopped")]
     Stopped,
+
+    /// A room was already at capacity when a user tried to join it.
+    #[error(transparent)]
+    RoomFull(#[from] crate::hub::JoinError),
 }
 
 impl Error {

@@ -27,6 +27,10 @@ pub(crate) struct HubInner {
     /// Per-room queues of users. A queue preserves insertion order and lets
     /// removal be O(1) on average instead of O(n) per call.
     pub(crate) rooms: RwLock<HashMap<RoomId, VecDeque<User>>>,
+    /// Serializes the capacity-check-and-move in [`HubInner::join_room`] so two
+    /// tasks cannot both observe `cap - 1` and both join. Joins are infrequent,
+    /// so a single global mutex is fine.
+    pub(crate) room_lock: parking_lot::Mutex<()>,
 }
 
 impl HubInner {
@@ -86,7 +90,58 @@ impl HubInner {
                 .insert(player_id.to_string(), user.clone());
         }
     }
+
+    /// Atomically checks `cap` and moves `user` into `room`.
+    ///
+    /// `cap == 0` means unlimited. Returns `Err` with the current occupancy
+    /// when the room is already full. The check and the move happen under
+    /// `room_lock`, so concurrent joins cannot both slip past a full room.
+    pub(crate) fn join_room(
+        &self,
+        user: &User,
+        room: RoomId,
+        cap: usize,
+    ) -> std::result::Result<(), JoinError> {
+        let _guard = self.room_lock.lock();
+
+        let occupancy = self
+            .rooms
+            .read()
+            .unwrap()
+            .get(&room)
+            .map_or(0, VecDeque::len);
+        if cap != 0 && occupancy >= cap {
+            return Err(JoinError::RoomFull { room, cap });
+        }
+
+        self.set_room(user, Some(room));
+        Ok(())
+    }
 }
+
+/// Error returned when a user cannot join a room.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinError {
+    /// The room is already at capacity.
+    RoomFull {
+        /// The room that rejected the join.
+        room: RoomId,
+        /// The configured capacity.
+        cap: usize,
+    },
+}
+
+impl std::fmt::Display for JoinError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RoomFull { room, cap } => {
+                write!(f, "room {room} is full (capacity {cap})")
+            }
+        }
+    }
+}
+
+impl std::error::Error for JoinError {}
 
 impl Default for UserManager {
     fn default() -> Self {
@@ -170,6 +225,18 @@ impl UserManager {
     /// Passing `None` removes the user from any room.
     pub fn set_user_room(&self, user: &User, room: Option<RoomId>) {
         self.inner.set_room(user, room);
+    }
+
+    /// Atomically checks `cap` and moves `user` into `room`.
+    ///
+    /// `cap == 0` means unlimited. See [`HubInner::join_room`].
+    pub(crate) fn join_room(
+        &self,
+        user: &User,
+        room: RoomId,
+        cap: usize,
+    ) -> std::result::Result<(), JoinError> {
+        self.inner.join_room(user, room, cap)
     }
 
     /// Returns the users in `room`.
@@ -433,5 +500,43 @@ mod tests {
         let user = manager.add(user);
         assert!(manager.get_by_player_id("p:1").is_some());
         assert_eq!(user.player_id(), Some("p:1"));
+    }
+
+    #[tokio::test]
+    async fn join_room_enforces_capacity_atomically() {
+        let manager = UserManager::new();
+        let users: Vec<User> = (0..100)
+            .map(|i| {
+                let (tx, _rx) = crate::user::channel();
+                manager.add(User::new(
+                    format!("u{i}"),
+                    "127.0.0.1:1".parse().unwrap(),
+                    tx,
+                ))
+            })
+            .collect();
+
+        let mut handles = Vec::new();
+        for user in &users {
+            let manager = manager.clone();
+            let user = user.clone();
+            handles.push(tokio::spawn(async move {
+                manager.inner.join_room(&user, 42, 10).is_ok()
+            }));
+        }
+
+        let mut ok = 0;
+        for handle in handles {
+            if handle.await.unwrap() {
+                ok += 1;
+            }
+        }
+        assert_eq!(ok, 10, "exactly 10 joins succeed");
+        assert_eq!(manager.room_len(42), 10);
+
+        // Disconnect frees a slot.
+        let victim = manager.room_members(42).remove(0);
+        manager.remove(victim.id());
+        assert_eq!(manager.room_len(42), 9);
     }
 }

@@ -443,6 +443,31 @@ impl Server {
         self.0.users.set_user_room(user, room);
     }
 
+    /// Atomically checks the room capacity and moves `user` into `room`.
+    ///
+    /// `cap == 0` means unlimited. Returns [`JoinError::RoomFull`] when the
+    /// room already holds `cap` users. Unlike [`Server::set_user_room`] the
+    /// check and the move are atomic, so concurrent joins cannot exceed the
+    /// capacity.
+    pub fn join_room(&self, user: &User, room: RoomId, cap: usize) -> Result<()> {
+        if room == 0 {
+            return Err(Error::InvalidAddress(
+                "room id 0 is not a valid room".into(),
+            ));
+        }
+        self.0
+            .users
+            .join_room(user, room, cap)
+            .map_err(Error::RoomFull)
+    }
+
+    /// Removes `user` from its current room, returning the old room id.
+    pub fn leave_room(&self, user: &User) -> Option<RoomId> {
+        let old = user.room();
+        user.set_room(None);
+        old
+    }
+
     /// Returns the users currently in `room`.
     #[must_use]
     pub fn room_members(&self, room: RoomId) -> Vec<User> {
