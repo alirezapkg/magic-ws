@@ -370,6 +370,26 @@ async fn client_survives_server_ping() {
 }
 
 #[tokio::test]
+async fn zero_connection_limit_means_unlimited() {
+    // `max_connections(0)` must behave like no limit at all.
+    let (server, addr) =
+        spawn_server(|builder| builder.max_connections(0).on_connect(|_| {})).await;
+
+    let client = Client::connect(&format!("ws://{addr}/ws")).await.unwrap();
+
+    // The user must be registered, not rejected.
+    let mut deadline = 50;
+    while server.user_count() == 0 && deadline > 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        deadline -= 1;
+    }
+    assert_eq!(server.user_count(), 1, "zero limit must not reject");
+
+    client.close().await;
+    server.shutdown();
+}
+
+#[tokio::test]
 async fn rate_limit_drops_overflow() {
     use magic_ws::{RateLimit, ViolationPolicy};
 

@@ -552,9 +552,10 @@ impl Server {
     }
 
     fn at_capacity(&self) -> bool {
+        // `0` means unlimited, matching the spec for INF-12.
         self.0
             .max_connections
-            .is_some_and(|limit| self.connection_count() >= limit)
+            .is_some_and(|limit| limit != 0 && self.connection_count() >= limit)
     }
 
     async fn accept(&self, stream: TcpStream, addr: std::net::SocketAddr) -> Result<()> {
