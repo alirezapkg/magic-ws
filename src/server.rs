@@ -43,6 +43,8 @@ use crate::user::User;
 use crate::UserManager;
 use crate::{Event, RoomId, UserState};
 
+pub use crate::user::{RateLimit, ViolationPolicy};
+
 /// WebSocket configuration applied to every accepted connection.
 pub(crate) fn ws_config() -> WebSocketConfig {
     WebSocketConfig {
@@ -187,6 +189,7 @@ pub struct ServerBuilder {
     max_connections: Option<usize>,
     max_queue: Option<usize>,
     heartbeat: Option<HeartbeatConfig>,
+    rate_limit: Option<RateLimit>,
 }
 
 impl std::fmt::Debug for ServerBuilder {
@@ -277,6 +280,17 @@ impl ServerBuilder {
         self
     }
 
+    /// Applies a per-user rate limit.
+    ///
+    /// Messages that arrive with no tokens left are dropped (or close the
+    /// connection after too many violations), depending on
+    /// [`RateLimit::on_violation`].
+    #[must_use]
+    pub fn rate_limit(mut self, cfg: RateLimit) -> Self {
+        self.rate_limit = Some(cfg);
+        self
+    }
+
     /// Builds the server.
     #[must_use]
     pub fn build(self) -> Server {
@@ -289,6 +303,7 @@ impl ServerBuilder {
             max_connections: self.max_connections,
             max_queue: self.max_queue.unwrap_or(protocol::SEND_QUEUE),
             heartbeat: self.heartbeat,
+            rate_limit: self.rate_limit,
             connections: AtomicUsize::new(0),
             shutdown: watch::channel(false).0,
             tasks: Mutex::new(Vec::new()),
@@ -311,6 +326,7 @@ struct ServerInner {
     max_connections: Option<usize>,
     max_queue: usize,
     heartbeat: Option<HeartbeatConfig>,
+    rate_limit: Option<RateLimit>,
     connections: AtomicUsize,
     shutdown: watch::Sender<bool>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
@@ -594,6 +610,9 @@ impl Server {
         let (tx, rx) = mpsc::channel(self.0.max_queue);
         let user = User::new(addr.to_string(), addr, tx);
         user.set_state(UserState::Connected);
+        if let Some(limit) = self.0.rate_limit {
+            user.set_rate_limit(limit);
+        }
         let user = self.0.users.add(user);
 
         if let Some(handler) = &self.0.on_connect {
@@ -604,7 +623,7 @@ impl Server {
         // that carries both binary payloads and control frames.
         let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel::<Message>();
         let (sink, mut stream) = connection.split();
-        let writer = tokio::spawn(writer_task(sink, rx, ctrl_rx));
+        let writer = tokio::spawn(writer_task(sink, rx, ctrl_rx, user.clone()));
 
         // Heartbeat: ping periodically and reap users that stop answering.
         let heartbeat_task = self.0.heartbeat.and_then(|hb| {
@@ -628,6 +647,22 @@ impl Server {
             let Some(item) = next else { break };
             match item {
                 Ok(Message::Binary(data)) => {
+                    // Rate limit applies to application messages only; control
+                    // frames are exempt.
+                    if !user.check_rate_limit() {
+                        if let Some(policy) = self.0.rate_limit.map(|cfg| cfg.on_violation) {
+                            match policy {
+                                crate::ViolationPolicy::Drop => {}
+                                crate::ViolationPolicy::DisconnectAfter(n) => {
+                                    if user.violations() >= n {
+                                        user.close_with(1008, "rate limit exceeded");
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     let bytes = data.to_vec();
                     if !self.route(&user, &bytes) {
                         if let Some(handler) = &self.0.on_message {
@@ -699,7 +734,7 @@ async fn heartbeat_task(user: User, ctrl_tx: mpsc::UnboundedSender<Message>, cfg
 
         // Disconnect once the user has missed too many pongs in a row.
         if user.heartbeat_expired(cfg.max_missed) {
-            user.close();
+            user.close_with(1001, "heartbeat timeout");
             break;
         }
 
@@ -714,6 +749,7 @@ async fn writer_task<S>(
     mut sink: ConnectionSink<S>,
     mut rx: mpsc::Receiver<Vec<u8>>,
     mut ctrl: mpsc::UnboundedReceiver<Message>,
+    user: User,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -726,7 +762,7 @@ async fn writer_task<S>(
             match rx.try_recv() {
                 Ok(message) => {
                     if sink.feed(Message::Binary(message)).await.is_err() {
-                        return finish(&mut sink).await;
+                        return finish_with_user(&mut sink, &user).await;
                     }
                     wrote_any = true;
                 }
@@ -737,46 +773,66 @@ async fn writer_task<S>(
         // Control frames (pongs, closes) must not sit behind a large batch.
         while let Ok(message) = ctrl.try_recv() {
             if sink.feed(message).await.is_err() {
-                return finish(&mut sink).await;
+                return finish_with_user(&mut sink, &user).await;
             }
             wrote_any = true;
         }
 
         if wrote_any {
             if sink.flush().await.is_err() {
-                return finish(&mut sink).await;
+                return finish_with_user(&mut sink, &user).await;
             }
             continue;
         }
 
-        // Nothing buffered: wait for either side.
-        let next = tokio::select! {
+        // Nothing buffered: wait for either side. Both channels are closed
+        // when the user is gone, so a `None` from either means we are done.
+        tokio::select! {
             biased;
-            Some(message) = rx.recv() => Some(Message::Binary(message)),
-            ctrl_message = ctrl.recv() => ctrl_message,
-            else => break,
-        };
-
-        let Some(message) = next else { break };
-        if sink.send(message).await.is_err() {
-            break;
+            msg = rx.recv() => {
+                match msg {
+                    Some(message) => {
+                        if sink.send(Message::Binary(message)).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+            msg = ctrl.recv() => {
+                match msg {
+                    Some(message) => {
+                        if sink.send(message).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
         }
     }
 
-    finish(&mut sink).await;
+    finish_with_user(&mut sink, &user).await;
 }
 
-/// Sends the closing frame after the writer loop ends.
-async fn finish<S>(sink: &mut ConnectionSink<S>)
+/// Like [`finish`] but uses the application-requested close code, if any.
+async fn finish_with_user<S>(sink: &mut ConnectionSink<S>, user: &User)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let _ = sink
-        .send(Message::Close(Some(close_frame(
-            CloseCode::Away,
-            "server closed connection",
-        ))))
-        .await;
+    if let Some((code, reason)) = user.close_code() {
+        let code = CloseCode::from(code);
+        let _ = sink
+            .send(Message::Close(Some(close_frame(code, &reason))))
+            .await;
+    } else {
+        let _ = sink
+            .send(Message::Close(Some(close_frame(
+                CloseCode::Away,
+                "server closed connection",
+            ))))
+            .await;
+    }
     let _ = sink.flush().await;
 }
 

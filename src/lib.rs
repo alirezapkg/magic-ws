@@ -79,10 +79,10 @@ pub use protocol::{
     PROTOCOL_VERSION, READ_BUF_SIZE, SEND_QUEUE, WRITE_BUF_SIZE,
 };
 pub use server::{
-    accept_key, ConnectHandler, DisconnectHandler, HeartbeatConfig, Server, ServerBuilder,
-    ShutdownSignal,
+    accept_key, ConnectHandler, DisconnectHandler, HeartbeatConfig, RateLimit, Server,
+    ServerBuilder, ShutdownSignal, ViolationPolicy,
 };
-pub use user::{User, UserState};
+pub use user::{SendError, User, UserState};
 
 /// Identifier of a room.
 ///

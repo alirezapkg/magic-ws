@@ -339,3 +339,141 @@ async fn rtt_is_measured_after_pong() {
     client.close().await;
     server.shutdown();
 }
+
+#[tokio::test]
+async fn rate_limit_drops_overflow() {
+    use magic_ws::{RateLimit, ViolationPolicy};
+
+    let (server, addr) = spawn_server(|builder| {
+        builder
+            .on_event(ECHO, |user, payload| {
+                user.send_event(ECHO, payload);
+            })
+            .rate_limit(RateLimit {
+                messages_per_second: 60,
+                burst: 10,
+                on_violation: ViolationPolicy::Drop,
+            })
+    })
+    .await;
+
+    let client = Client::connect(&format!("ws://{addr}/ws")).await.unwrap();
+
+    // Register the reply handler before sending so we count every echo.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let events = client.events();
+    events.on(ECHO, move |_payload| {
+        let _ = tx.send(());
+    });
+
+    // Wait for registration.
+    let mut deadline = 50;
+    while server.user_count() == 0 && deadline > 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        deadline -= 1;
+    }
+
+    // Burst 1000 messages as fast as possible; only ~burst (10) should get
+    // through, the rest are dropped by the token bucket.
+    for _ in 0..1000 {
+        client.emit(ECHO, b"x");
+    }
+
+    // Count replies within a short window.
+    let mut received = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+            Ok(Some(())) => received += 1,
+            _ => break,
+        }
+    }
+    assert!(
+        received <= 20,
+        "rate limit should drop most of the burst, got {received}"
+    );
+
+    client.close().await;
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn rate_limit_disconnects_after_violations() {
+    use magic_ws::{RateLimit, ViolationPolicy};
+
+    let (server, addr) = spawn_server(|builder| {
+        builder.rate_limit(RateLimit {
+            messages_per_second: 60,
+            burst: 5,
+            on_violation: ViolationPolicy::DisconnectAfter(3),
+        })
+    })
+    .await;
+
+    let client = Client::connect(&format!("ws://{addr}/ws")).await.unwrap();
+
+    let mut deadline = 50;
+    while server.user_count() == 0 && deadline > 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        deadline -= 1;
+    }
+
+    // Flood past the burst; after 3 violations the server closes us.
+    for _ in 0..200 {
+        client.emit(ECHO, b"x");
+    }
+
+    // The client should observe the close within a reasonable window.
+    tokio::time::timeout(Duration::from_secs(3), client.closed())
+        .await
+        .expect("client should be closed by the rate limiter");
+    assert!(client.is_closed());
+
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn close_with_custom_code_reaches_client() {
+    let (server, addr) = spawn_server(|builder| {
+        builder.on_connect(move |user| {
+            // Disconnect immediately with a custom code so the test is fast.
+            user.close_with(4001, "auth failed");
+        })
+    })
+    .await;
+
+    // Raw client so we can inspect the close code.
+    let (socket, _) = tokio_tungstenite::client_async(
+        format!("ws://{addr}/ws").parse::<http::Uri>().unwrap(),
+        tokio::net::TcpStream::connect(addr).await.unwrap(),
+    )
+    .await
+    .unwrap();
+
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let mut socket = socket;
+    socket
+        .send(Message::Binary(vec![magic_ws::PROTOCOL_VERSION]))
+        .await
+        .unwrap();
+
+    // Expect a Close frame with code 4001.
+    let mut code = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), socket.next()).await {
+            Ok(Some(Ok(Message::Close(Some(frame))))) => {
+                code = Some(frame.code);
+                break;
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => break,
+        }
+    }
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+    assert_eq!(code, Some(CloseCode::from(4001)));
+
+    server.shutdown();
+}

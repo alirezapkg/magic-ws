@@ -12,6 +12,92 @@ use crate::hub::HubInner;
 use crate::protocol::SEND_QUEUE;
 use crate::RoomId;
 
+/// Error returned by [`User::try_send`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendError {
+    /// The user's connection is gone.
+    Closed,
+    /// The outbound queue is full.
+    QueueFull,
+    /// The user is not in the connected state.
+    NotConnected,
+}
+
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Closed => write!(f, "connection closed"),
+            Self::QueueFull => write!(f, "send queue full"),
+            Self::NotConnected => write!(f, "user not connected"),
+        }
+    }
+}
+
+impl std::error::Error for SendError {}
+
+/// Rate-limit policy applied to incoming messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViolationPolicy {
+    /// Silently drop messages that exceed the limit.
+    Drop,
+    /// Close the connection after `n` violations.
+    DisconnectAfter(u32),
+}
+
+/// Token-bucket rate limit configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimit {
+    /// Sustained messages per second.
+    pub messages_per_second: u32,
+    /// Maximum burst size.
+    pub burst: u32,
+    /// What to do when a message arrives with no tokens left.
+    pub on_violation: ViolationPolicy,
+}
+
+impl Default for RateLimit {
+    fn default() -> Self {
+        Self {
+            messages_per_second: 60,
+            burst: 60,
+            on_violation: ViolationPolicy::Drop,
+        }
+    }
+}
+
+/// Per-user token bucket.
+#[derive(Debug)]
+struct TokenBucket {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl TokenBucket {
+    fn new(capacity: u32) -> Self {
+        Self {
+            tokens: f64::from(capacity),
+            last_refill: Instant::now(),
+        }
+    }
+
+    /// Consumes one token, refilling based on elapsed time.
+    ///
+    /// Returns `true` when a token was available.
+    fn consume(&mut self, rate: u32, burst: u32, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.last_refill);
+        self.last_refill = now;
+        let refill = elapsed.as_secs_f64() * f64::from(rate);
+        let cap = f64::from(burst);
+        self.tokens = (self.tokens + refill).min(cap);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Lifecycle state of a connected user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -74,6 +160,16 @@ pub(crate) struct Inner {
     /// Fires when the connection is closed so the read loop can stop waiting
     /// on the socket even when the peer has gone silent.
     closed_tx: watch::Sender<bool>,
+    /// Optional rate limit. `OnceLock` so it can be set right after the user is
+    /// created (before the read loop starts) and is then immutable.
+    rate_limit: OnceLock<RateLimit>,
+    /// Per-user token bucket.
+    bucket: Mutex<TokenBucket>,
+    /// Number of rate-limit violations observed so far.
+    violations: AtomicU32,
+    /// Close code and reason requested by the application. The writer task
+    /// reads this when it finishes.
+    close_code: Mutex<Option<(u16, String)>>,
 }
 
 impl User {
@@ -94,6 +190,10 @@ impl User {
                 missed_pongs: AtomicU32::new(0),
                 rtt_us: AtomicU64::new(0),
                 closed_tx,
+                rate_limit: OnceLock::new(),
+                bucket: Mutex::new(TokenBucket::new(0)),
+                violations: AtomicU32::new(0),
+                close_code: Mutex::new(None),
             }),
         }
     }
@@ -168,6 +268,38 @@ impl User {
         *self.inner.last_pong.lock()
     }
 
+    /// Attaches `limit` to this user. Must be called before the read loop
+    /// starts; later calls are ignored.
+    pub(crate) fn set_rate_limit(&self, limit: RateLimit) {
+        if self.inner.rate_limit.set(limit).is_ok() {
+            *self.inner.bucket.lock() = TokenBucket::new(limit.burst);
+        }
+    }
+
+    /// Returns the number of rate-limit violations observed so far.
+    #[must_use]
+    pub fn violations(&self) -> u32 {
+        self.inner.violations.load(Ordering::Acquire)
+    }
+
+    /// Consumes one token for an incoming message.
+    ///
+    /// Returns `true` when the message is allowed. When the bucket is empty the
+    /// violation counter is incremented and `false` is returned; the caller
+    /// applies [`ViolationPolicy`].
+    pub(crate) fn check_rate_limit(&self) -> bool {
+        let Some(limit) = self.inner.rate_limit.get() else {
+            return true;
+        };
+        let mut bucket = self.inner.bucket.lock();
+        if bucket.consume(limit.messages_per_second, limit.burst, Instant::now()) {
+            true
+        } else {
+            self.inner.violations.fetch_add(1, Ordering::AcqRel);
+            false
+        }
+    }
+
     /// Returns `true` when the user missed more than `max_missed` Pings.
     pub(crate) fn heartbeat_expired(&self, max_missed: u32) -> bool {
         self.inner.missed_pongs.load(Ordering::Acquire) > max_missed
@@ -237,27 +369,39 @@ impl User {
         self.inner.closed.load(Ordering::Acquire)
     }
 
+    /// Queues `data` for delivery, returning a precise error on failure.
+    ///
+    /// Returns [`SendError::NotConnected`] when the user has not finished the
+    /// handshake, [`SendError::Closed`] when the connection is gone, and
+    /// [`SendError::QueueFull`] when the outbound queue is full.
+    pub fn try_send(&self, data: Vec<u8>) -> std::result::Result<(), SendError> {
+        if self.is_closed() {
+            return Err(SendError::Closed);
+        }
+        if self.state() != UserState::Connected {
+            return Err(SendError::NotConnected);
+        }
+        let guard = self.inner.tx.lock();
+        let Some(tx) = guard.as_ref() else {
+            return Err(SendError::Closed);
+        };
+        match tx.try_send(data) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                tracing::trace!(user = %self.inner.id, "send queue full, dropping packet");
+                Err(SendError::QueueFull)
+            }
+            Err(TrySendError::Closed(_)) => Err(SendError::Closed),
+        }
+    }
+
     /// Queues `data` for delivery.
     ///
     /// Returns `true` when the message was queued. Returns `false` when the
     /// connection is gone or its queue is full, in which case the message is
-    /// silently dropped.
+    /// silently dropped. See [`User::try_send`] for a precise error.
     pub fn send(&self, data: Vec<u8>) -> bool {
-        if self.is_closed() || self.state() != UserState::Connected {
-            return false;
-        }
-        let guard = self.inner.tx.lock();
-        let Some(tx) = guard.as_ref() else {
-            return false;
-        };
-        match tx.try_send(data) {
-            Ok(()) => true,
-            Err(TrySendError::Full(_)) => {
-                tracing::trace!(user = %self.inner.id, "send queue full, dropping packet");
-                false
-            }
-            Err(TrySendError::Closed(_)) => false,
-        }
+        self.try_send(data).is_ok()
     }
 
     /// Queues an already encoded MagicWS message for this event.
@@ -290,6 +434,25 @@ impl User {
             *self.inner.tx.lock() = None;
             let _ = self.inner.closed_tx.send(true);
         }
+    }
+
+    /// Closes the connection with a custom WebSocket close code and reason.
+    ///
+    /// The writer task sends the code once the outbound queue drains. If the
+    /// connection is already closed this is a no-op.
+    pub fn close_with(&self, code: u16, reason: &str) {
+        *self.inner.close_code.lock() = Some((code, reason.to_string()));
+        self.close();
+    }
+
+    /// Rejects the connection with close code `1008` (policy violation).
+    pub fn reject(&self, reason: &str) {
+        self.close_with(1008, reason);
+    }
+
+    /// Returns the requested close code and reason, if any.
+    pub(crate) fn close_code(&self) -> Option<(u16, String)> {
+        self.inner.close_code.lock().clone()
     }
 
     /// Returns a receiver that resolves once the connection is closed.
@@ -373,5 +536,64 @@ mod tests {
         assert_eq!(u.room(), Some(42));
         u.set_room(None);
         assert_eq!(u.room(), None);
+    }
+
+    #[tokio::test]
+    async fn try_send_reports_precise_errors() {
+        let (u, mut rx) = user();
+
+        // Pending -> NotConnected.
+        assert_eq!(u.try_send(vec![1]), Err(SendError::NotConnected));
+
+        u.set_state(UserState::Connected);
+        assert_eq!(u.try_send(vec![1]), Ok(()));
+
+        // Fill the queue.
+        let mut got_full = false;
+        for _ in 0..1000 {
+            if u.try_send(vec![0u8; 8]) == Err(SendError::QueueFull) {
+                got_full = true;
+                break;
+            }
+        }
+        assert!(got_full, "queue should eventually be full");
+
+        // Drain one to make room, then close.
+        assert!(rx.try_recv().is_ok());
+        u.close();
+        assert_eq!(u.try_send(vec![2]), Err(SendError::Closed));
+    }
+
+    #[test]
+    fn close_with_records_code() {
+        let (u, _rx) = user();
+        u.close_with(4001, "bye");
+        assert_eq!(u.close_code(), Some((4001, "bye".to_string())));
+        assert!(u.is_closed());
+    }
+
+    #[test]
+    fn reject_uses_1008() {
+        let (u, _rx) = user();
+        u.reject("banned");
+        assert_eq!(u.close_code(), Some((1008, "banned".to_string())));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_expires_after_max_missed() {
+        let (u, _rx) = user();
+        assert!(!u.heartbeat_expired(3));
+        for _ in 0..3 {
+            u.note_ping_sent(Instant::now());
+        }
+        assert!(!u.heartbeat_expired(3), "equal to max is allowed");
+        u.note_ping_sent(Instant::now());
+        assert!(u.heartbeat_expired(3), "over max is expired");
+
+        // A pong after a small delay resets the counter and records an RTT.
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        u.record_pong(Instant::now());
+        assert!(!u.heartbeat_expired(3), "pong resets the counter");
+        assert!(u.rtt().is_some(), "rtt is set after a pong");
     }
 }
