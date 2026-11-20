@@ -36,13 +36,19 @@ tracing = { version = "0.1.44", default-features = false }
 # provider, which would make rustls panic at runtime.
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 ring = { version = "0.17.14", default-features = false, optional = true }
+# Optional: TLS server listener (`Server::listen_tls`).
+tokio-rustls = { version = "0.26.6", default-features = false, optional = true }
+rustls-pemfile = { version = "2.2", optional = true }
 
 [features]
 default = ["tls"]
-## Enables `wss://` client support backed by rustls + webpki roots.
+## Enables `wss://` client support and the built-in TLS server listener,
+## backed by rustls + webpki roots.
 tls = [
     "dep:ring",
     "dep:rustls",
+    "dep:tokio-rustls",
+    "dep:rustls-pemfile",
     "tokio-tungstenite/rustls-tls-webpki-roots",
 ]
 
@@ -50,10 +56,9 @@ tls = [
 tokio = { version = "1.54.1", features = ["full"] }
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 clap = { version = "4.6.7", default-features = false, features = ["derive", "std", "help", "usage"] }
-tokio-rustls = { version = "0.26.6", default-features = false }
-rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-pemfile = "1.0.4"
 rustls-pki-types = "1.16.0"
+# Used by the TLS e2e test to parse the throwaway localhost certificate.
+rustls-pemfile = "2.2"
 
 [[example]]
 name = "test_server"
@@ -62,6 +67,7 @@ path = "examples/test_server.rs"
 [[example]]
 name = "tls_test"
 path = "examples/tls_test.rs"
+required-features = ["tls"]
 
 [[example]]
 name = "basic"

@@ -36,6 +36,11 @@ use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 use tokio_tungstenite::{accept_async_with_config, WebSocketStream};
 
+#[cfg(feature = "tls")]
+use tokio_rustls::rustls::ServerConfig;
+#[cfg(feature = "tls")]
+use tokio_rustls::TlsAcceptor;
+
 use crate::error::{Error, Result};
 use crate::events::{MessageHandler, ServerEvents};
 use crate::protocol::{self, WRITE_BUF_SIZE};
@@ -94,6 +99,74 @@ impl HeartbeatConfig {
     /// Returns `true` when the heartbeat is disabled.
     fn is_disabled(&self) -> bool {
         self.interval.is_zero()
+    }
+}
+
+/// TLS configuration for [`Server::listen_tls`].
+///
+/// Both `cert` and `key` are PEM-encoded (the same format the
+/// `rustls-pemfile` crate reads).
+#[cfg(feature = "tls")]
+#[derive(Clone)]
+pub struct TlsConfig {
+    /// PEM-encoded certificate chain.
+    pub cert: Vec<u8>,
+    /// PEM-encoded private key.
+    pub key: Vec<u8>,
+}
+
+#[cfg(feature = "tls")]
+impl std::fmt::Debug for TlsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsConfig")
+            .field("cert_bytes", &self.cert.len())
+            .field("key_bytes", &self.key.len())
+            .finish()
+    }
+}
+
+/// Builds a rustls `ServerConfig` from a [`TlsConfig`].
+#[cfg(feature = "tls")]
+fn tls_server_config(cfg: TlsConfig) -> Result<ServerConfig> {
+    use tokio_rustls::rustls;
+
+    // Pick a crypto provider if none is installed yet. `listen_tls` can be
+    // called without going through `Client::connect`, so install one here too.
+    let _ = crate::install_crypto_provider();
+
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut cfg.cert.as_slice())
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|err| Error::InvalidAddress(format!("invalid TLS certificate: {err}")))?;
+    if certs.is_empty() {
+        return Err(Error::InvalidAddress("no certificate found in PEM".into()));
+    }
+
+    let key = rustls_pemfile::private_key(&mut cfg.key.as_slice())
+        .map_err(|err| Error::InvalidAddress(format!("invalid TLS private key: {err}")))?
+        .ok_or_else(|| Error::InvalidAddress("no private key found in PEM".into()))?;
+
+    ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|err| Error::InvalidAddress(format!("invalid TLS certificate/key: {err}")))
+}
+
+/// Stub returned when the `tls` feature is disabled, so callers get a clear
+/// error instead of a compile failure.
+#[cfg(not(feature = "tls"))]
+#[derive(Clone)]
+pub struct TlsConfig {
+    /// PEM-encoded certificate chain.
+    pub cert: Vec<u8>,
+    /// PEM-encoded private key.
+    pub key: Vec<u8>,
+}
+
+#[cfg(not(feature = "tls"))]
+impl std::fmt::Debug for TlsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsConfig").finish_non_exhaustive()
     }
 }
 
@@ -415,6 +488,110 @@ impl Server {
         let local = listener.local_addr().map_err(Error::Io)?;
         tracing::info!(%local, "magic-ws server listening");
         self.serve(listener).await
+    }
+
+    /// Binds `addr` and serves TLS (`wss://`) until shutdown.
+    ///
+    /// The certificate and key are PEM-encoded. This is the built-in
+    /// alternative to running the TLS handshake yourself and handing the
+    /// stream to [`Server::accept_stream`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the `tls` feature is disabled, the PEM is
+    /// invalid, or the address cannot be bound.
+    #[cfg(feature = "tls")]
+    pub async fn listen_tls(
+        &self,
+        addr: impl tokio::net::ToSocketAddrs,
+        cfg: TlsConfig,
+    ) -> Result<()> {
+        let acceptor = TlsAcceptor::from(std::sync::Arc::new(tls_server_config(cfg)?));
+        let listener = TcpListener::bind(addr)
+            .await
+            .map_err(|err| Error::InvalidAddress(format!("{err} (while binding)")))?;
+        let local = listener.local_addr().map_err(Error::Io)?;
+        tracing::info!(%local, "magic-ws TLS server listening");
+        self.serve_tls(listener, acceptor).await
+    }
+
+    /// Binds `addr` and serves TLS (`wss://`) until shutdown.
+    ///
+    /// The certificate and key are PEM-encoded. This is the built-in
+    /// alternative to running the TLS handshake yourself and handing the
+    /// stream to [`Server::accept_stream`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the `tls` feature is disabled, the PEM is
+    /// invalid, or the address cannot be bound.
+    #[cfg(not(feature = "tls"))]
+    pub async fn listen_tls(
+        &self,
+        _addr: impl tokio::net::ToSocketAddrs,
+        _cfg: TlsConfig,
+    ) -> Result<()> {
+        Err(Error::InvalidAddress(
+            "the `tls` feature is disabled; enable it to use listen_tls".into(),
+        ))
+    }
+
+    /// Like [`Server::listen_tls`] but on an already-bound listener.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Server::listen_tls`].
+    #[cfg(feature = "tls")]
+    pub async fn serve_tls(&self, listener: TcpListener, acceptor: TlsAcceptor) -> Result<()> {
+        if *self.0.shutdown.borrow() {
+            return Err(Error::Stopped);
+        }
+
+        let mut shutdown = self.0.shutdown.subscribe();
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        break;
+                    }
+                }
+                accepted = listener.accept() => {
+                    let (stream, addr) = accepted.map_err(Error::Io)?;
+                    if !self.0.accepting.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if self.at_capacity() {
+                        tracing::warn!(%addr, "connection rejected: server at capacity");
+                        drop(stream);
+                        continue;
+                    }
+                    if let Err(err) = stream.set_nodelay(true) {
+                        tracing::trace!(%err, "failed to set nodelay");
+                    }
+                    let acceptor = acceptor.clone();
+                    let this = self.clone();
+                    let handle = tokio::spawn(async move {
+                        match acceptor.accept(stream).await {
+                            Ok(tls) => {
+                                if let Err(err) = this.accept_stream(tls, addr).await {
+                                    tracing::debug!(%addr, %err, "tls connection ended with error");
+                                }
+                            }
+                            Err(err) => {
+                                tracing::debug!(%addr, %err, "tls handshake failed");
+                            }
+                        }
+                    });
+                    self.0.tasks.lock().await.push(handle);
+                }
+            }
+        }
+
+        let tasks: Vec<JoinHandle<()>> = self.0.tasks.lock().await.drain(..).collect();
+        for task in tasks {
+            task.abort();
+        }
+        Ok(())
     }
 
     /// Serves connections arriving on `listener` until shutdown.

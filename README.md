@@ -55,11 +55,59 @@ Requires a Rust toolchain of **1.80** or newer.
 
 | Feature | Default | What it does |
 |---|---|---|
-| `tls` | yes | `wss://` client support (rustls + webpki roots). Disable for a smaller build: `default-features = false` |
+| `tls` | yes | `wss://` client support and the built-in TLS server listener (rustls + webpki roots). Disable for a smaller build: `default-features = false` |
 
 ## Quick start
 
 ### Server
+
+A minimal server with room, event routing and a heartbeat:
+
+```rust
+use magic_ws::{Event, HeartbeatConfig, RateLimit, Server, ViolationPolicy};
+
+const CHAT: Event = Event::new("chat_message");
+
+#[tokio::main]
+async fn main() -> magic_ws::Result<()> {
+    let server = Server::builder()
+        .on_connect(|user| println!("{} connected", user.id()))
+        .on_disconnect(|user| println!("{} left", user.id()))
+        .on_event(CHAT, |user, payload| {
+            user.send_event(CHAT, payload); // echo back
+        })
+        .heartbeat(HeartbeatConfig::default())     // ping dead connections
+        .rate_limit(RateLimit {
+            messages_per_second: 120,
+            burst: 60,
+            on_violation: ViolationPolicy::Drop,
+        })
+        .build();
+
+    // Graceful shutdown on Ctrl-C: drain queued messages first.
+    tokio::select! {
+        _ = server.listen("127.0.0.1:8080") => {}
+        _ = tokio::signal::ctrl_c() => {
+            server.shutdown_graceful(std::time::Duration::from_secs(5)).await;
+        }
+    }
+    Ok(())
+}
+```
+
+### TLS server
+
+With the `tls` feature (on by default), serve `wss://` directly:
+
+```rust
+use magic_ws::{Server, TlsConfig};
+
+let cfg = TlsConfig {
+    cert: std::fs::read("cert.pem")?,
+    key: std::fs::read("key.pem")?,
+};
+server.listen_tls("127.0.0.1:8443", cfg).await
+```
 
 ```rust
 use magic_ws::{Event, Server};
@@ -136,6 +184,19 @@ use magic_ws::Server;
 server.set_user_room(&user, 42);
 server.set_user_room(&user, 0);          // leave the room
 
+// Capacity-limited, atomic join: exactly `cap` users can be in the room.
+match server.join_room(&user, 42, 10) {
+    Ok(()) => {}
+    Err(magic_ws::JoinError::RoomFull { room, cap }) => {
+        eprintln!("room {room} is full (capacity {cap})");
+    }
+}
+
+// Leave explicitly and get the old room id back.
+if let Some(old) = server.leave_room(&user) {
+    println!("left room {old}");
+}
+
 // Fan out an event to the whole room, sender included.
 let delivered = server.emit_to_room(42, CHAT, b"payload");
 
@@ -145,6 +206,25 @@ let delivered = server.to_room(42).emit_except(CHAT, &user.id(), b"payload");
 
 `emit_to_room` and `emit_except` return how many users the message was queued
 for — useful for metrics.
+
+### Stable player identity
+
+`User::id()` is the socket address and changes on reconnect. For a stable,
+application-assigned id, call `set_player_id` (once):
+
+```rust
+use magic_ws::Server;
+
+server.on_connect(|user| {
+    user.set_player_id("player:123"); // stable across reconnects
+});
+
+// Look a user up by player id, or disconnect them by id.
+if let Some(user) = server.users().get_by_player_id("player:123") {
+    println!("found {}", user.id());
+}
+server.disconnect_by_player_id("player:123");
+```
 
 ### Talking to the server from inside a handler
 
@@ -184,21 +264,32 @@ let server = Server::builder()
         assert_eq!(user.state(), UserState::Connected);
         user.set_room(7);              // assign a room immediately
     })
-    .max_connections(10_000)           // reject beyond this many
+    .max_connections(10_000)           // reject beyond this many (0 = unlimited)
     .max_queue(512)                    // per-connection outbound queue
     .build();
 
-// Graceful shutdown: stops accepting and closes every connection.
+// Immediate shutdown: stops accepting and closes every connection.
 server.shutdown();
 
-// Or await it from a signal handler.
-tokio::select! {
-    _ = tokio::signal::ctrl_c() => server.shutdown(),
-}
+// Graceful shutdown: stop accepting, drain queued messages up to `timeout`,
+// then close. `on_shutdown` callbacks run once at the end.
+server.on_shutdown(|| println!("drained and closed"));
+server.shutdown_graceful(std::time::Duration::from_secs(5)).await;
 ```
 
 `on_connect` runs *after* the user is registered, so `set_room` there is safe
 and immediately visible to room fan-out.
+
+Custom close codes are available too:
+
+```rust
+use magic_ws::Server;
+
+server.on_event(CHAT, |user, _payload| {
+    user.close_with(4001, "auth failed"); // custom code
+    // user.reject("banned");             // 1008 policy violation
+});
+```
 
 ### Sending without a room
 
@@ -211,10 +302,40 @@ server.send_to(&user, message_bytes);
 
 // Everyone.
 let delivered = server.broadcast(&message_bytes);
+
+// Precise error instead of a bool:
+match user.try_send(message_bytes) {
+    Ok(()) => {}
+    Err(magic_ws::SendError::QueueFull) => eprintln!("dropped: queue full"),
+    Err(magic_ws::SendError::Closed) => eprintln!("connection closed"),
+    Err(magic_ws::SendError::NotConnected) => eprintln!("not connected"),
+}
 ```
 
 All sends are **non-blocking**: if the per-connection queue is full the message
-is dropped and `false` is returned. Nothing ever waits on a slow client.
+is dropped (or `SendError::QueueFull` is returned by `try_send`). Nothing ever
+waits on a slow client.
+
+### Heartbeat and RTT
+
+Enable a heartbeat to drop dead connections and measure latency:
+
+```rust
+use magic_ws::{HeartbeatConfig, Server};
+
+let server = Server::builder()
+    .heartbeat(HeartbeatConfig {
+        interval: std::time::Duration::from_secs(15),
+        timeout: std::time::Duration::from_secs(30),
+        max_missed: 3,
+    })
+    .build();
+
+// Per-user RTT (Some after the first pong) and last-seen time.
+if let Some(rtt) = user.rtt() {
+    println!("rtt: {rtt:?}");
+}
+```
 
 ### TLS
 
@@ -224,8 +345,20 @@ is dropped and `false` is returned. Nothing ever waits on a slow client.
 let client = Client::connect("wss://example.com/ws").await?;
 ```
 
-To terminate TLS on the server, accept the stream yourself and hand it to
-MagicWS:
+On the server, the simplest option is the built-in TLS listener:
+
+```rust
+use magic_ws::{Server, TlsConfig};
+
+let cfg = TlsConfig {
+    cert: std::fs::read("cert.pem")?,
+    key: std::fs::read("key.pem")?,
+};
+server.listen_tls("127.0.0.1:8443", cfg).await?;
+```
+
+To terminate TLS on the server yourself (for custom certificate handling),
+accept the stream and hand it to MagicWS:
 
 ```rust
 use tokio_rustls::TlsAcceptor;

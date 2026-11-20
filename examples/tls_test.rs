@@ -29,21 +29,16 @@ fn server_config() -> Arc<ServerConfig> {
     magic_ws::install_crypto_provider().expect("crypto provider");
 
     let key = rustls_pemfile::pkcs8_private_keys(&mut certs::KEY_PEM.as_bytes())
+        .next()
         .expect("readable key PEM")
-        .pop()
-        .expect("a key is present");
+        .expect("one key");
     let certs: Vec<_> = rustls_pemfile::certs(&mut certs::CERT_PEM.as_bytes())
-        .expect("readable certificate PEM")
-        .into_iter()
-        .map(rustls_pki_types::CertificateDer::from)
-        .collect();
+        .collect::<std::result::Result<_, _>>()
+        .expect("readable certificate PEM");
 
     let config = ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(
-            certs,
-            rustls_pki_types::PrivatePkcs8KeyDer::from(key).into(),
-        )
+        .with_single_cert(certs, key.into())
         .expect("usable certificate");
 
     Arc::new(config)
@@ -97,10 +92,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Trust the self-signed certificate instead of the webpki roots.
     let cert = rustls_pemfile::certs(&mut certs::CERT_PEM.as_bytes())
-        .expect("readable certificate PEM")
-        .into_iter()
-        .map(rustls_pki_types::CertificateDer::from)
         .next()
+        .expect("readable certificate PEM")
         .expect("one certificate");
 
     let mut roots = tokio_rustls::rustls::RootCertStore::empty();

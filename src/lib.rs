@@ -78,6 +78,8 @@ pub use protocol::{
     is_version_packet, pack_message, unpack_message, version_packet, EventId, HEADER_LEN,
     PROTOCOL_VERSION, READ_BUF_SIZE, SEND_QUEUE, WRITE_BUF_SIZE,
 };
+#[cfg(feature = "tls")]
+pub use server::TlsConfig;
 pub use server::{
     accept_key, ConnectHandler, DisconnectHandler, HeartbeatConfig, RateLimit, Server,
     ServerBuilder, ShutdownHandler, ShutdownSignal, ViolationPolicy,

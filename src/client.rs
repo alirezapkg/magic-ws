@@ -102,7 +102,14 @@ impl Client {
     ///
     /// Same as [`Client::connect`].
     pub async fn connect_with_timeout(url: &str, timeout: Duration) -> Result<Self> {
-        Self::connect_with_connector(url, timeout, None).await
+        #[cfg(feature = "tls")]
+        {
+            Self::connect_with_connector(url, timeout, None).await
+        }
+        #[cfg(not(feature = "tls"))]
+        {
+            Self::connect_with_connector(url, timeout).await
+        }
     }
 
     /// Connects with a caller-supplied rustls client configuration.
@@ -165,13 +172,24 @@ impl Client {
             .0
         };
 
+        // Plain `ws://` without the `tls` feature. `wss://` is rejected because
+        // there is no TLS implementation compiled in.
         #[cfg(not(feature = "tls"))]
         let socket = {
-            let _ = request;
-            let _ = tcp;
-            return Err(Error::InvalidUrl(
-                "wss:// requires the `tls` feature".to_string(),
-            ));
+            if request.uri().scheme_str() == Some("wss") {
+                return Err(Error::InvalidUrl(
+                    "wss:// requires the `tls` feature".to_string(),
+                ));
+            }
+            tokio::time::timeout(timeout, tokio_tungstenite::client_async(request, tcp))
+                .await
+                .map_err(|_| {
+                    Error::upgrade(tokio_tungstenite::tungstenite::Error::Io(
+                        std::io::Error::new(std::io::ErrorKind::TimedOut, "handshake timeout"),
+                    ))
+                })?
+                .map_err(Error::upgrade)?
+                .0
         };
 
         Self::start(socket).await

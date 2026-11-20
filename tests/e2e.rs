@@ -447,6 +447,104 @@ async fn on_shutdown_fires_once() {
     assert_eq!(counter.load(Ordering::SeqCst), 1);
 }
 
+#[cfg(feature = "tls")]
+#[tokio::test]
+async fn tls_listener_roundtrip() {
+    use magic_ws::{Client, TlsConfig};
+    use std::sync::Arc;
+    use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+
+    let cert = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/certs/cert.pem"
+    ))
+    .expect("cert.pem");
+    let key = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/certs/key.pem"
+    ))
+    .expect("key.pem");
+
+    let server = Server::builder()
+        .on_event(ECHO, |user, payload| {
+            user.send_event(ECHO, payload);
+        })
+        .build();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let task_server = server.clone();
+    let tls_cfg = TlsConfig {
+        cert: cert.clone(),
+        key,
+    };
+    tokio::spawn(async move {
+        let _ = task_server
+            .listen_tls(format!("127.0.0.1:{}", addr.port()), tls_cfg)
+            .await;
+    });
+
+    // Give the listener time to start.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Trust the self-signed cert.
+    let mut roots = RootCertStore::empty();
+    let mut certs = std::io::Cursor::new(cert);
+    for cert in rustls_pemfile::certs(&mut certs) {
+        roots.add(cert.unwrap()).unwrap();
+    }
+    let config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+    let client = Client::connect_with_tls_config(
+        &format!("wss://127.0.0.1:{}/ws", addr.port()),
+        Duration::from_secs(5),
+        Arc::new(config),
+    )
+    .await
+    .expect("tls connect");
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let tx = std::sync::Mutex::new(Some(tx));
+    let events = client.events();
+    events.on(ECHO, move |payload| {
+        if let Some(tx) = tx.lock().unwrap().take() {
+            let _ = tx.send(payload.to_vec());
+        }
+    });
+
+    client.emit(ECHO, b"tls hello");
+    let reply = tokio::time::timeout(Duration::from_secs(5), rx)
+        .await
+        .expect("reply over tls")
+        .expect("sender alive");
+    assert_eq!(reply, b"tls hello");
+
+    client.close().await;
+    server.shutdown();
+}
+
+#[cfg(feature = "tls")]
+#[tokio::test]
+async fn tls_listener_rejects_invalid_pem() {
+    use magic_ws::TlsConfig;
+
+    let server = Server::builder().build();
+    let result = server
+        .listen_tls(
+            "127.0.0.1:0",
+            TlsConfig {
+                cert: b"not a cert".to_vec(),
+                key: b"not a key".to_vec(),
+            },
+        )
+        .await;
+    assert!(result.is_err(), "invalid PEM should fail");
+}
+
 #[tokio::test]
 async fn rate_limit_drops_overflow() {
     use magic_ws::{RateLimit, ViolationPolicy};
