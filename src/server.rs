@@ -20,7 +20,7 @@
 //! ```
 
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -61,6 +61,9 @@ pub type ConnectHandler = Arc<dyn Fn(&User) + Send + Sync + 'static>;
 
 /// Callback fired when a connection ends.
 pub type DisconnectHandler = Arc<dyn Fn(&User) + Send + Sync + 'static>;
+
+/// Callback fired once a graceful shutdown finishes.
+pub type ShutdownHandler = Arc<dyn Fn() + Send + Sync + 'static>;
 
 /// Heartbeat and round-trip-time configuration.
 ///
@@ -304,9 +307,11 @@ impl ServerBuilder {
             max_queue: self.max_queue.unwrap_or(protocol::SEND_QUEUE),
             heartbeat: self.heartbeat,
             rate_limit: self.rate_limit,
+            accepting: AtomicBool::new(true),
             connections: AtomicUsize::new(0),
             shutdown: watch::channel(false).0,
             tasks: Mutex::new(Vec::new()),
+            on_shutdown: parking_lot::Mutex::new(Vec::new()),
         }))
     }
 }
@@ -327,9 +332,13 @@ struct ServerInner {
     max_queue: usize,
     heartbeat: Option<HeartbeatConfig>,
     rate_limit: Option<RateLimit>,
+    /// False once a shutdown has begun; the accept loop stops accepting.
+    accepting: AtomicBool,
     connections: AtomicUsize,
     shutdown: watch::Sender<bool>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// Callbacks run once after a graceful shutdown.
+    on_shutdown: parking_lot::Mutex<Vec<ShutdownHandler>>,
 }
 
 impl std::fmt::Debug for Server {
@@ -430,6 +439,10 @@ impl Server {
                 }
                 accepted = listener.accept() => {
                     let (stream, addr) = accepted.map_err(Error::Io)?;
+                    // Stop accepting once a shutdown has begun.
+                    if !self.0.accepting.load(Ordering::Acquire) {
+                        break;
+                    }
                     if self.at_capacity() {
                         tracing::warn!(%addr, "connection rejected: server at capacity");
                         drop(stream);
@@ -462,10 +475,55 @@ impl Server {
     /// [`ShutdownSignal`] exists yet, which would silently swallow the
     /// shutdown request.
     pub fn shutdown(&self) {
+        self.0.accepting.store(false, Ordering::Release);
         self.0.shutdown.send_replace(true);
         for user in self.0.users.users() {
             user.close();
         }
+    }
+
+    /// Stops accepting and waits up to `timeout` for the queued messages to
+    /// drain before closing every remaining connection.
+    ///
+    /// Unlike [`Server::shutdown`] this gives the writer tasks a window to
+    /// flush their outbound queues, so messages queued before the shutdown are
+    /// not lost.
+    pub async fn shutdown_graceful(&self, timeout: Duration) {
+        // Stop accepting immediately.
+        self.0.accepting.store(false, Ordering::Release);
+        let _ = self.0.shutdown.send_replace(true);
+
+        // Wait for queues to drain (or the timeout to elapse).
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let pending = self
+                .0
+                .users
+                .users()
+                .iter()
+                .any(|u| !u.is_closed() && u.queue_pending());
+            if !pending || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Close whatever is left.
+        for user in self.0.users.users() {
+            user.close();
+        }
+
+        // Run shutdown callbacks once.
+        let callbacks: Vec<ShutdownHandler> = self.0.on_shutdown.lock().drain(..).collect();
+        for callback in callbacks {
+            callback();
+        }
+    }
+
+    /// Registers a callback fired once after [`Server::shutdown_graceful`]
+    /// finishes.
+    pub fn on_shutdown<F: Fn() + Send + Sync + 'static>(&self, f: F) {
+        self.0.on_shutdown.lock().push(Arc::new(f));
     }
 
     /// Disconnects a single user.

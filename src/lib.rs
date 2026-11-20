@@ -80,7 +80,7 @@ pub use protocol::{
 };
 pub use server::{
     accept_key, ConnectHandler, DisconnectHandler, HeartbeatConfig, RateLimit, Server,
-    ServerBuilder, ShutdownSignal, ViolationPolicy,
+    ServerBuilder, ShutdownHandler, ShutdownSignal, ViolationPolicy,
 };
 pub use user::{SendError, User, UserState};
 

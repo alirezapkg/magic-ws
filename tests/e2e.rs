@@ -390,6 +390,64 @@ async fn zero_connection_limit_means_unlimited() {
 }
 
 #[tokio::test]
+async fn graceful_shutdown_flushes_queued_messages() {
+    let (server, addr) = spawn_server(|builder| builder).await;
+
+    let client = Client::connect(&format!("ws://{addr}/ws")).await.unwrap();
+
+    // Wait for registration.
+    let mut deadline = 50;
+    while server.user_count() == 0 && deadline > 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        deadline -= 1;
+    }
+    assert_eq!(server.user_count(), 1);
+
+    // Queue a message for the user, then start a graceful shutdown.
+    let user = server.users().users().remove(0);
+    let events = client.events();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let tx = std::sync::Mutex::new(Some(tx));
+    events.on(ECHO, move |payload| {
+        if let Some(tx) = tx.lock().unwrap().take() {
+            let _ = tx.send(payload.to_vec());
+        }
+    });
+
+    assert!(server.emit(&user, ECHO, b"bye"));
+
+    // The message should still arrive even though we shut down right after.
+    let shutdown = tokio::spawn({
+        let server = server.clone();
+        async move { server.shutdown_graceful(Duration::from_secs(2)).await }
+    });
+
+    let reply = tokio::time::timeout(Duration::from_secs(3), rx)
+        .await
+        .expect("queued message should arrive before the connection closes")
+        .expect("sender alive");
+    assert_eq!(reply, b"bye");
+
+    let _ = shutdown.await;
+}
+
+#[tokio::test]
+async fn on_shutdown_fires_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let (server, _addr) = spawn_server(|builder| builder).await;
+    let counter = Arc::new(AtomicUsize::new(0));
+    let c = Arc::clone(&counter);
+    server.on_shutdown(move || {
+        c.fetch_add(1, Ordering::SeqCst);
+    });
+
+    server.shutdown_graceful(Duration::from_millis(100)).await;
+    assert_eq!(counter.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn rate_limit_drops_overflow() {
     use magic_ws::{RateLimit, ViolationPolicy};
 

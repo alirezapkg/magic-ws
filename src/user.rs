@@ -415,6 +415,15 @@ impl User {
         self.max_capacity()
     }
 
+    /// Returns `true` when the outbound queue still holds messages.
+    pub(crate) fn queue_pending(&self) -> bool {
+        let guard = self.inner.tx.lock();
+        let Some(tx) = guard.as_ref() else {
+            return false;
+        };
+        tx.max_capacity() > tx.capacity() || !tx.is_closed()
+    }
+
     /// Returns the outbound queue capacity.
     pub(crate) fn max_capacity(&self) -> usize {
         self.inner
