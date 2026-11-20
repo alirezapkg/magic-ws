@@ -240,3 +240,102 @@ async fn events_beyond_the_prefix_are_routed() {
     client.close().await;
     server.shutdown();
 }
+
+#[tokio::test]
+async fn heartbeat_disconnects_silent_client() {
+    use magic_ws::HeartbeatConfig;
+
+    // A heartbeat with a very short timeout so the test stays fast.
+    let (server, addr) = spawn_server(|builder| {
+        builder.heartbeat(HeartbeatConfig {
+            interval: Duration::from_millis(30),
+            timeout: Duration::from_millis(200),
+            max_missed: 3,
+        })
+    })
+    .await;
+
+    // Raw client that completes the upgrade and the version handshake but then
+    // never reads. tungstenite queues an automatic Pong when it reads a Ping,
+    // but this client never calls `next()`, so no Pong is ever written back.
+    let (socket, _) = tokio_tungstenite::client_async(
+        format!("ws://{addr}/ws").parse::<http::Uri>().unwrap(),
+        tokio::net::TcpStream::connect(addr).await.unwrap(),
+    )
+    .await
+    .unwrap();
+
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let mut socket = socket;
+    socket
+        .send(Message::Binary(vec![magic_ws::PROTOCOL_VERSION]))
+        .await
+        .unwrap();
+
+    // Wait until the server has registered us.
+    let mut deadline = 50;
+    while server.user_count() == 0 && deadline > 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        deadline -= 1;
+    }
+    assert_eq!(server.user_count(), 1, "user registered");
+
+    // Never read from the socket: the server's pings go unanswered, so after
+    // `max_missed` the user should be reaped from the registry.
+    let mut deadline = 100;
+    while server.user_count() != 0 && deadline > 0 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        deadline -= 1;
+    }
+    assert_eq!(
+        server.user_count(),
+        0,
+        "silent client should be disconnected by the heartbeat"
+    );
+
+    // Keep the socket alive until the end so the OS does not reset the
+    // connection before the heartbeat fires.
+    drop(socket);
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn rtt_is_measured_after_pong() {
+    use magic_ws::HeartbeatConfig;
+
+    let (server, addr) = spawn_server(|builder| {
+        builder.heartbeat(HeartbeatConfig {
+            interval: Duration::from_millis(30),
+            timeout: Duration::from_secs(1),
+            max_missed: 3,
+        })
+    })
+    .await;
+
+    // Connect the Rust client, which answers Pings automatically (after INF-11).
+    let client = Client::connect(&format!("ws://{addr}/ws")).await.unwrap();
+
+    // Give the heartbeat time to fire a ping and receive the pong.
+    let mut observed_rtt = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        if server
+            .users()
+            .users()
+            .into_iter()
+            .any(|u| u.rtt().is_some())
+        {
+            observed_rtt = true;
+            break;
+        }
+    }
+    assert!(
+        observed_rtt,
+        "server should measure an RTT from the client's pong"
+    );
+
+    client.close().await;
+    server.shutdown();
+}

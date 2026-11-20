@@ -1,11 +1,12 @@
 //! Users and rooms.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{mpsc, watch};
 
 use crate::hub::HubInner;
 use crate::protocol::SEND_QUEUE;
@@ -46,11 +47,11 @@ impl UserState {
 /// networking tasks.
 #[derive(Debug)]
 pub struct User {
-    inner: Arc<Inner>,
+    pub(crate) inner: Arc<Inner>,
 }
 
 #[derive(Debug)]
-struct Inner {
+pub(crate) struct Inner {
     id: String,
     player_id: OnceLock<String>,
     addr: std::net::SocketAddr,
@@ -61,10 +62,23 @@ struct Inner {
     /// Registry that owns this user, so [`User::set_room`] can keep the room
     /// index in sync. `Weak` because the registry also holds the user.
     hub: Mutex<Option<Weak<HubInner>>>,
+    /// Last time a Pong was received from this user, used by the heartbeat
+    /// watchdog to detect dead connections.
+    last_pong: Mutex<Option<Instant>>,
+    /// Last time a Ping was sent to this user, used to compute RTT.
+    last_ping_sent: Mutex<Option<Instant>>,
+    /// Number of consecutive Pings sent without an intervening Pong.
+    pub(crate) missed_pongs: AtomicU32,
+    /// Last measured round-trip time in microseconds. `0` means unknown.
+    rtt_us: AtomicU64,
+    /// Fires when the connection is closed so the read loop can stop waiting
+    /// on the socket even when the peer has gone silent.
+    closed_tx: watch::Sender<bool>,
 }
 
 impl User {
     pub(crate) fn new(id: String, addr: std::net::SocketAddr, tx: mpsc::Sender<Vec<u8>>) -> Self {
+        let (closed_tx, _) = watch::channel(false);
         Self {
             inner: Arc::new(Inner {
                 id,
@@ -75,6 +89,11 @@ impl User {
                 closed: AtomicBool::new(false),
                 tx: Mutex::new(Some(tx)),
                 hub: Mutex::new(None),
+                last_pong: Mutex::new(None),
+                last_ping_sent: Mutex::new(None),
+                missed_pongs: AtomicU32::new(0),
+                rtt_us: AtomicU64::new(0),
+                closed_tx,
             }),
         }
     }
@@ -113,6 +132,57 @@ impl User {
     #[must_use]
     pub fn player_id(&self) -> Option<&str> {
         self.inner.player_id.get().map(String::as_str)
+    }
+
+    /// Records that a Ping was sent at `now`.
+    pub(crate) fn note_ping_sent(&self, now: Instant) {
+        *self.inner.last_ping_sent.lock() = Some(now);
+        self.inner.missed_pongs.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Records a received Pong, updating the RTT estimate and the missed-pong
+    /// counter.
+    pub(crate) fn record_pong(&self, now: Instant) {
+        *self.inner.last_pong.lock() = Some(now);
+        self.inner.missed_pongs.store(0, Ordering::Release);
+        if let Some(sent) = *self.inner.last_ping_sent.lock() {
+            let elapsed = now.saturating_duration_since(sent);
+            self.inner
+                .rtt_us
+                .store(elapsed.as_micros() as u64, Ordering::Release);
+        }
+    }
+
+    /// Returns the last measured round-trip time, if any.
+    ///
+    /// The value is `Some` once at least one Ping/Pong exchange completed.
+    #[must_use]
+    pub fn rtt(&self) -> Option<Duration> {
+        let us = self.inner.rtt_us.load(Ordering::Acquire);
+        (us > 0).then(|| Duration::from_micros(us))
+    }
+
+    /// Returns the last time a Pong was received, if any.
+    #[must_use]
+    pub fn last_seen(&self) -> Option<Instant> {
+        *self.inner.last_pong.lock()
+    }
+
+    /// Returns `true` when the user missed more than `max_missed` Pings.
+    pub(crate) fn heartbeat_expired(&self, max_missed: u32) -> bool {
+        self.inner.missed_pongs.load(Ordering::Acquire) > max_missed
+    }
+
+    /// Returns `true` when the last Pong is older than `timeout`.
+    #[allow(dead_code)]
+    pub(crate) fn heartbeat_timed_out(&self, timeout: Duration, now: Instant) -> bool {
+        let last_pong = *self.inner.last_pong.lock();
+        let last_ping = *self.inner.last_ping_sent.lock();
+        match (last_pong, last_ping) {
+            (Some(pong), _) => now.saturating_duration_since(pong) > timeout,
+            (None, Some(ping)) => now.saturating_duration_since(ping) > timeout,
+            (None, None) => false,
+        }
     }
 
     /// Returns the remote address of this user.
@@ -213,11 +283,18 @@ impl User {
     /// Requests a graceful shutdown of this user's connection.
     ///
     /// Dropping the sender closes the channel, so the writer task drains the
-    /// queued messages and then finishes.
+    /// queued messages and then finishes. The read loop is also woken so it
+    /// stops waiting on the socket.
     pub fn close(&self) {
         if !self.inner.closed.swap(true, Ordering::AcqRel) {
             *self.inner.tx.lock() = None;
+            let _ = self.inner.closed_tx.send(true);
         }
+    }
+
+    /// Returns a receiver that resolves once the connection is closed.
+    pub(crate) fn closed_receiver(&self) -> watch::Receiver<bool> {
+        self.inner.closed_tx.subscribe()
     }
 }
 

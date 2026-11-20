@@ -79,7 +79,8 @@ pub use protocol::{
     PROTOCOL_VERSION, READ_BUF_SIZE, SEND_QUEUE, WRITE_BUF_SIZE,
 };
 pub use server::{
-    accept_key, ConnectHandler, DisconnectHandler, Server, ServerBuilder, ShutdownSignal,
+    accept_key, ConnectHandler, DisconnectHandler, HeartbeatConfig, Server, ServerBuilder,
+    ShutdownSignal,
 };
 pub use user::{User, UserState};
 

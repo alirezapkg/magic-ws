@@ -23,6 +23,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, Stream, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -58,6 +59,38 @@ pub type ConnectHandler = Arc<dyn Fn(&User) + Send + Sync + 'static>;
 
 /// Callback fired when a connection ends.
 pub type DisconnectHandler = Arc<dyn Fn(&User) + Send + Sync + 'static>;
+
+/// Heartbeat and round-trip-time configuration.
+///
+/// The server sends a Ping every [`interval`](Self::interval) and disconnects
+/// a user that did not answer within [`timeout`](Self::timeout). Set
+/// `interval` to [`Duration::ZERO`] to disable the heartbeat.
+#[derive(Debug, Clone, Copy)]
+pub struct HeartbeatConfig {
+    /// How often a Ping is sent.
+    pub interval: Duration,
+    /// How long to wait for a Pong before considering the user dead.
+    pub timeout: Duration,
+    /// Unused compatibility field; the watchdog uses `timeout` alone.
+    pub max_missed: u32,
+}
+
+impl Default for HeartbeatConfig {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(15),
+            timeout: Duration::from_secs(30),
+            max_missed: 3,
+        }
+    }
+}
+
+impl HeartbeatConfig {
+    /// Returns `true` when the heartbeat is disabled.
+    fn is_disabled(&self) -> bool {
+        self.interval.is_zero()
+    }
+}
 
 type WsError = tokio_tungstenite::tungstenite::Error;
 
@@ -153,6 +186,7 @@ pub struct ServerBuilder {
     events: ServerEvents,
     max_connections: Option<usize>,
     max_queue: Option<usize>,
+    heartbeat: Option<HeartbeatConfig>,
 }
 
 impl std::fmt::Debug for ServerBuilder {
@@ -232,6 +266,17 @@ impl ServerBuilder {
         self
     }
 
+    /// Enables the heartbeat with `cfg`.
+    ///
+    /// The server pings every [`HeartbeatConfig::interval`] and disconnects a
+    /// user that has not answered within [`HeartbeatConfig::timeout`].
+    /// When not set, the heartbeat is disabled.
+    #[must_use]
+    pub fn heartbeat(mut self, cfg: HeartbeatConfig) -> Self {
+        self.heartbeat = Some(cfg);
+        self
+    }
+
     /// Builds the server.
     #[must_use]
     pub fn build(self) -> Server {
@@ -243,6 +288,7 @@ impl ServerBuilder {
             events: self.events,
             max_connections: self.max_connections,
             max_queue: self.max_queue.unwrap_or(protocol::SEND_QUEUE),
+            heartbeat: self.heartbeat,
             connections: AtomicUsize::new(0),
             shutdown: watch::channel(false).0,
             tasks: Mutex::new(Vec::new()),
@@ -264,6 +310,7 @@ struct ServerInner {
     events: ServerEvents,
     max_connections: Option<usize>,
     max_queue: usize,
+    heartbeat: Option<HeartbeatConfig>,
     connections: AtomicUsize,
     shutdown: watch::Sender<bool>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
@@ -559,8 +606,26 @@ impl Server {
         let (sink, mut stream) = connection.split();
         let writer = tokio::spawn(writer_task(sink, rx, ctrl_rx));
 
+        // Heartbeat: ping periodically and reap users that stop answering.
+        let heartbeat_task = self.0.heartbeat.and_then(|hb| {
+            if hb.is_disabled() {
+                None
+            } else {
+                let ctrl_tx = ctrl_tx.clone();
+                let user = user.clone();
+                Some(tokio::spawn(heartbeat_task(user, ctrl_tx, hb)))
+            }
+        });
+
         // --- read loop ---------------------------------------------------------
-        while let Some(item) = stream.next().await {
+        let mut closed_rx = user.closed_receiver();
+        loop {
+            let next = tokio::select! {
+                biased;
+                _ = closed_rx.changed() => None,
+                item = stream.next() => item,
+            };
+            let Some(item) = next else { break };
             match item {
                 Ok(Message::Binary(data)) => {
                     let bytes = data.to_vec();
@@ -576,7 +641,12 @@ impl Server {
                         break;
                     }
                 }
-                Ok(Message::Pong(_)) | Ok(Message::Text(_)) | Ok(Message::Frame(_)) => {}
+                Ok(Message::Pong(_)) => {
+                    // Record the pong so the heartbeat watchdog knows the user
+                    // is alive and the RTT estimate is refreshed.
+                    user.record_pong(Instant::now());
+                }
+                Ok(Message::Text(_)) | Ok(Message::Frame(_)) => {}
                 Err(err) => {
                     tracing::debug!(%addr, %err, "read error");
                     break;
@@ -585,6 +655,9 @@ impl Server {
         }
 
         writer.abort();
+        if let Some(task) = heartbeat_task {
+            task.abort();
+        }
         self.0.users.remove(user.id());
         drop(guard);
 
@@ -608,6 +681,34 @@ impl Server {
 /// packet. Draining the queue first and flushing once turns a burst of 100
 /// queued messages into a single write.
 const WRITE_BATCH: usize = 256;
+
+/// Sends a Ping every `cfg.interval` and closes the connection when the user
+/// misses more than `cfg.max_missed` consecutive Pongs.
+///
+/// The task ends when the user is closed or the control channel is gone.
+async fn heartbeat_task(user: User, ctrl_tx: mpsc::UnboundedSender<Message>, cfg: HeartbeatConfig) {
+    let mut ticker = tokio::time::interval(cfg.interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        ticker.tick().await;
+
+        if user.is_closed() {
+            break;
+        }
+
+        // Disconnect once the user has missed too many pongs in a row.
+        if user.heartbeat_expired(cfg.max_missed) {
+            user.close();
+            break;
+        }
+
+        user.note_ping_sent(Instant::now());
+        if ctrl_tx.send(Message::Ping(Vec::new())).is_err() {
+            break;
+        }
+    }
+}
 
 async fn writer_task<S>(
     mut sink: ConnectionSink<S>,
