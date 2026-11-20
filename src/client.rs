@@ -446,10 +446,11 @@ where
                 }
                 Ok(Message::Close(_)) => break,
                 Ok(Message::Ping(payload)) => {
-                    // Queue an empty frame so the writer emits a pong; the
-                    // payload is echoed verbatim by the writer via `Message::Pong`.
+                    // tungstenite automatically queues a Pong when a Ping is
+                    // read through `StreamExt::next`, so the connection stays
+                    // open. Do NOT set `closed` here: doing so would kill a
+                    // healthy client whenever the server sends a heartbeat.
                     let _ = payload;
-                    state.closed.store(true, Ordering::Release);
                 }
                 Ok(Message::Pong(_)) | Ok(Message::Text(_)) | Ok(Message::Frame(_)) => {}
                 Err(err) => {

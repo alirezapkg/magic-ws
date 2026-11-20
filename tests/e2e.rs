@@ -335,6 +335,35 @@ async fn rtt_is_measured_after_pong() {
         observed_rtt,
         "server should measure an RTT from the client's pong"
     );
+    // The client must stay open even though it received Pings.
+    assert!(!client.is_closed(), "client must survive server pings");
+
+    client.close().await;
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn client_survives_server_ping() {
+    use magic_ws::HeartbeatConfig;
+
+    let (server, addr) = spawn_server(|builder| {
+        builder.heartbeat(HeartbeatConfig {
+            interval: Duration::from_millis(20),
+            timeout: Duration::from_secs(2),
+            max_missed: 3,
+        })
+    })
+    .await;
+
+    let client = Client::connect(&format!("ws://{addr}/ws")).await.unwrap();
+
+    // Wait through several ping intervals; the client must not close.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        !client.is_closed(),
+        "receiving a Ping must not close the client"
+    );
+    assert!(client.is_open());
 
     client.close().await;
     server.shutdown();
