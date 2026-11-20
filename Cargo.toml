@@ -77,6 +77,14 @@ path = "examples/basic.rs"
 name = "events_benchmark"
 path = "examples/events_benchmark.rs"
 
+[[example]]
+name = "bench_server"
+path = "examples/bench_server.rs"
+
+[[example]]
+name = "bench_client"
+path = "examples/bench_client.rs"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

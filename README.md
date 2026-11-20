@@ -474,25 +474,47 @@ The Unity client lives in
 
 Measured on a 4-core machine, 5000 clients spread over 50 rooms, 10 second
 run, 50 ms tick — identical workload to the Go benchmark (three events;
-two broadcast to the room, one echoed to the sender):
+two broadcast to the room, one echoed to the sender).
+
+The benchmark runs the **server and the load generator in two separate
+processes**, so the reported memory is the server's own footprint and not a
+combined total that includes the client tasks:
 
 | | MagicWS (Rust) | Original (Go) |
 |---|---|---|
 | Throughput | **~1.1–1.2 M msg/s** | ~0.6–0.8 M msg/s |
-| Peak RSS | **~315 MiB** | ~390 MiB |
+| Server peak RSS (5000 clients, under load) | **~206 MiB** | ~390 MiB |
+| Server idle RSS | **~3.3 MiB** | — |
 | CPU | **~2.5 cores** | ~2.9 cores |
 | GC pauses | none | 2 per run |
 
-Memory is flat per connection: roughly **14 KiB** of server-side state per
-connection, and the process stays at ~1.3 MiB when idle. 10 000 idle
-connections sit at ~140 MiB.
+Memory scales linearly with connections: the server sits at **~3.3 MiB when
+idle**, grows to **~90 MiB for 5000 connected (idle) clients** (~17 KiB per
+connection), and peaks at **~206 MiB under the full fan-out load**. The load
+generator itself is a separate process and costs ~66 MiB for its 5000 clients,
+which is why the two-process methodology matters: an earlier single-process
+benchmark reported ~315 MiB because it counted the client tasks too.
 
 The main win comes from batching writes: `SinkExt::send` flushes after every
 message, which costs one syscall per packet. MagicWS drains the outbound queue
 and flushes once, which took the same workload from 236 k msg/s to 1.16 M
 msg/s.
 
-Run it yourself:
+### Running the benchmark
+
+Two terminals — the server (with RSS logging) and the load generator:
+
+```bash
+# terminal 1: server, prints its own RSS every second
+cargo run --release --example bench_server -- --addr 127.0.0.1:8080
+
+# terminal 2: 5000 clients for 10 seconds
+cargo run --release --example bench_client -- \
+    --clients 5000 --addr 127.0.0.1:8080 --duration 10 --tick-ms 50
+```
+
+The single-process `events_benchmark` example is still available for a quick
+combined run:
 
 ```bash
 cargo run --release --example events_benchmark -- --clients 5000 --rooms 50 --duration 10
@@ -505,12 +527,16 @@ cargo run --release --example events_benchmark -- --clients 5000 --rooms 50 --du
 | `test_server` | echo + chat server, with a room |
 | `basic` | one-shot client that waits for a reply |
 | `tls_test` | `wss://` round-trip with a self-signed certificate |
-| `events_benchmark` | multi-client stress test with flags |
+| `events_benchmark` | single-process multi-client stress test |
+| `bench_server` | standalone benchmark server with RSS logging |
+| `bench_client` | multi-process load generator |
 
 ```bash
 cargo run --example test_server
 cargo run --example basic
 cargo run --example tls_test
+cargo run --release --example bench_server   # terminal 1
+cargo run --release --example bench_client   # terminal 2
 ```
 
 The certificate in `examples/certs/` is a throwaway self-signed localhost
