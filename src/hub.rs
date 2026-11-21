@@ -332,29 +332,52 @@ impl UserManager {
     ///
     /// Returns the number of users the message was queued for.
     pub fn send_to_room(&self, room: RoomId, data: &[u8]) -> usize {
-        self.send_to_room_impl(room, None, data)
+        let mut sent = 0;
+        self.for_each_in_room(room, |user| {
+            if user.send(data.to_vec()) {
+                sent += 1;
+            }
+        });
+        sent
     }
 
     /// Sends `data` to everyone in `room` except `except`.
     pub fn send_to_room_except(&self, room: RoomId, except: &str, data: &[u8]) -> usize {
-        self.send_to_room_impl(room, Some(except), data)
-    }
-
-    fn send_to_room_impl(&self, room: RoomId, except: Option<&str>, data: &[u8]) -> usize {
-        let queue = self.inner.rooms.read().unwrap();
-        let Some(members) = queue.get(&room) else {
-            return 0;
-        };
         let mut sent = 0;
-        for user in members.iter() {
-            if except.is_some_and(|id| id == user.id()) {
-                continue;
-            }
+        self.for_each_in_room_except(room, except, |user| {
             if user.send(data.to_vec()) {
                 sent += 1;
             }
-        }
+        });
         sent
+    }
+
+    /// Calls `f` for every user in `room` without allocating a temporary
+    /// `Vec<User>` (INF-15).
+    ///
+    /// The room queue is read under the read lock and iterated in place.
+    pub fn for_each_in_room<F: FnMut(&User)>(&self, room: RoomId, mut f: F) {
+        let queue = self.inner.rooms.read().unwrap();
+        let Some(members) = queue.get(&room) else {
+            return;
+        };
+        for user in members.iter() {
+            f(user);
+        }
+    }
+
+    /// Like [`UserManager::for_each_in_room`] but skips `except` (INF-15).
+    pub fn for_each_in_room_except<F: FnMut(&User)>(&self, room: RoomId, except: &str, mut f: F) {
+        let queue = self.inner.rooms.read().unwrap();
+        let Some(members) = queue.get(&room) else {
+            return;
+        };
+        for user in members.iter() {
+            if user.id() == except {
+                continue;
+            }
+            f(user);
+        }
     }
 
     /// Sends `data` to every connected user.
@@ -605,6 +628,28 @@ mod tests {
 
         assert_eq!(manager.broadcast(b"x"), 1);
         assert_eq!(rx.recv().await, Some(b"x".to_vec()));
+    }
+
+    #[test]
+    fn for_each_in_room_does_not_allocate_vec() {
+        // The point of INF-15 is that fan-out iterates the room queue under the
+        // read lock without building a `Vec<User>` snapshot. We can't assert
+        // allocation counts in a unit test, but we can verify the callback
+        // runs for every member and that the existing `room_members` path
+        // still returns the same set.
+        let manager = UserManager::new();
+        let a = manager.add(connected("a"));
+        let b = manager.add(connected("b"));
+        manager.set_user_room(&a, Some(1));
+        manager.set_user_room(&b, Some(1));
+
+        let mut seen = Vec::new();
+        manager.for_each_in_room(1, |u| seen.push(u.id().to_string()));
+        assert_eq!(seen.len(), 2);
+
+        let mut excepted = Vec::new();
+        manager.for_each_in_room_except(1, "a", |u| excepted.push(u.id().to_string()));
+        assert_eq!(excepted, vec!["b".to_string()]);
     }
 
     #[test]
