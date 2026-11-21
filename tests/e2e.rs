@@ -592,6 +592,75 @@ async fn metrics_counters_increase() {
 }
 
 #[tokio::test]
+async fn per_ip_limit_rejects_third_connection() {
+    // 2 connections from localhost are allowed, the 3rd is rejected.
+    let (server, addr) = spawn_server(|builder| builder.max_connections_per_ip(2)).await;
+
+    let c1 = Client::connect(&format!("ws://{addr}/ws")).await.unwrap();
+    let c2 = Client::connect(&format!("ws://{addr}/ws")).await.unwrap();
+
+    let mut deadline = 50;
+    while server.user_count() < 2 && deadline > 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        deadline -= 1;
+    }
+    assert_eq!(server.user_count(), 2, "two connections admitted");
+
+    // Third is rejected: the server drops the TCP stream before the WS
+    // handshake, so the client connect fails.
+    let c3 = Client::connect(&format!("ws://{addr}/ws")).await;
+    assert!(c3.is_err(), "third connection should be rejected");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(server.user_count(), 2, "still only two users");
+
+    c1.close().await;
+    c2.close().await;
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn ban_ip_disconnects_and_blocks() {
+    let (server, addr) = spawn_server(|builder| builder).await;
+
+    let client = Client::connect(&format!("ws://{addr}/ws")).await.unwrap();
+
+    let mut deadline = 50;
+    while server.user_count() == 0 && deadline > 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        deadline -= 1;
+    }
+    assert_eq!(server.user_count(), 1);
+
+    let loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    assert!(!server.is_banned(loopback));
+
+    // Ban localhost: the connected user should be dropped.
+    server.ban_ip(loopback);
+    assert!(server.is_banned(loopback));
+
+    tokio::time::timeout(Duration::from_secs(2), client.closed())
+        .await
+        .expect("client should be disconnected by the ban");
+
+    // A new connection from the banned IP is rejected.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let c2 = Client::connect(&format!("ws://{addr}/ws")).await;
+    assert!(c2.is_err(), "banned ip cannot connect");
+
+    // Unban allows it again.
+    server.unban_ip(loopback);
+    assert!(!server.is_banned(loopback));
+    let c3 = Client::connect(&format!("ws://{addr}/ws")).await;
+    assert!(c3.is_ok(), "after unban the ip can connect");
+    if let Ok(c3) = c3 {
+        c3.close().await;
+    }
+
+    server.shutdown();
+}
+
+#[tokio::test]
 async fn rate_limit_drops_overflow() {
     use magic_ws::{RateLimit, ViolationPolicy};
 

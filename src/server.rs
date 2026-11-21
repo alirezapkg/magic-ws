@@ -292,6 +292,7 @@ pub struct ServerBuilder {
     on_room_join: Option<crate::hub::RoomJoinHandler>,
     on_room_leave: Option<crate::hub::RoomLeaveHandler>,
     on_room_empty: Option<crate::hub::RoomEmptyHandler>,
+    max_connections_per_ip: Option<usize>,
 }
 
 impl std::fmt::Debug for ServerBuilder {
@@ -423,6 +424,15 @@ impl ServerBuilder {
         self
     }
 
+    /// Limits how many connections a single IP may open (INF-17).
+    ///
+    /// `0` means unlimited.
+    #[must_use]
+    pub fn max_connections_per_ip(mut self, limit: usize) -> Self {
+        self.max_connections_per_ip = Some(limit);
+        self
+    }
+
     /// Builds the server.
     #[must_use]
     pub fn build(self) -> Server {
@@ -457,6 +467,9 @@ impl ServerBuilder {
             messages_sent: AtomicU64::new(0),
             messages_received: AtomicU64::new(0),
             dropped: Arc::new(AtomicU64::new(0)),
+            max_connections_per_ip: self.max_connections_per_ip,
+            ip_connections: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            banned_ips: parking_lot::Mutex::new(std::collections::HashSet::new()),
         }))
     }
 }
@@ -491,6 +504,10 @@ struct ServerInner {
     messages_sent: AtomicU64,
     messages_received: AtomicU64,
     dropped: Arc<AtomicU64>,
+    // --- per-IP limits and bans (INF-17) ---
+    max_connections_per_ip: Option<usize>,
+    ip_connections: parking_lot::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>,
+    banned_ips: parking_lot::Mutex<std::collections::HashSet<std::net::IpAddr>>,
 }
 
 impl std::fmt::Debug for Server {
@@ -659,6 +676,10 @@ impl Server {
                         drop(stream);
                         continue;
                     }
+                    if !self.admit_ip(&addr) {
+                        drop(stream);
+                        continue;
+                    }
                     if let Err(err) = stream.set_nodelay(true) {
                         tracing::trace!(%err, "failed to set nodelay");
                     }
@@ -716,6 +737,10 @@ impl Server {
                     }
                     if self.at_capacity() {
                         tracing::warn!(%addr, "connection rejected: server at capacity");
+                        drop(stream);
+                        continue;
+                    }
+                    if !self.admit_ip(&addr) {
                         drop(stream);
                         continue;
                     }
@@ -809,6 +834,34 @@ impl Server {
         self.0.users.remove_by_player_id(id).is_some()
     }
 
+    /// Bans `ip`: existing connections from it are dropped and future ones
+    /// are rejected before the WebSocket upgrade (INF-17).
+    pub fn ban_ip(&self, ip: std::net::IpAddr) {
+        self.0.banned_ips.lock().insert(ip);
+        // Disconnect any users currently connected from this IP.
+        let users: Vec<User> = self
+            .0
+            .users
+            .users()
+            .into_iter()
+            .filter(|u| u.addr().ip() == ip)
+            .collect();
+        for user in users {
+            user.close_with(1008, "banned");
+        }
+    }
+
+    /// Removes `ip` from the ban list.
+    pub fn unban_ip(&self, ip: std::net::IpAddr) {
+        self.0.banned_ips.lock().remove(&ip);
+    }
+
+    /// Returns `true` when `ip` is banned.
+    #[must_use]
+    pub fn is_banned(&self, ip: std::net::IpAddr) -> bool {
+        self.0.banned_ips.lock().contains(&ip)
+    }
+
     /// Queues `msg` for `user`.
     ///
     /// Returns `false` when the user is gone or its queue is full.
@@ -885,6 +938,43 @@ impl Server {
         self.0
             .max_connections
             .is_some_and(|limit| limit != 0 && self.connection_count() >= limit)
+    }
+
+    /// Returns `true` when `addr` is banned or its IP is over the per-IP limit
+    /// (INF-17). When allowed, the per-IP counter is incremented.
+    fn admit_ip(&self, addr: &std::net::SocketAddr) -> bool {
+        let ip = addr.ip();
+        if self.is_banned(ip) {
+            tracing::warn!(%addr, "connection rejected: ip banned");
+            return false;
+        }
+        let Some(limit) = self.0.max_connections_per_ip else {
+            return true;
+        };
+        if limit == 0 {
+            return true;
+        }
+        let mut counts = self.0.ip_connections.lock();
+        let count = counts.entry(ip).or_insert(0);
+        if *count >= limit {
+            tracing::warn!(%addr, "connection rejected: per-ip limit");
+            return false;
+        }
+        *count += 1;
+        true
+    }
+
+    /// Decrements the per-IP counter for `addr` (INF-17).
+    fn release_ip(&self, addr: &std::net::SocketAddr) {
+        if self.0.max_connections_per_ip.is_some() {
+            let mut counts = self.0.ip_connections.lock();
+            if let Some(count) = counts.get_mut(&addr.ip()) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    counts.remove(&addr.ip());
+                }
+            }
+        }
     }
 
     async fn accept(&self, stream: TcpStream, addr: std::net::SocketAddr) -> Result<()> {
@@ -1035,6 +1125,7 @@ impl Server {
             task.abort();
         }
         self.0.users.remove(user.id());
+        self.release_ip(&addr);
         drop(guard);
 
         if let Some(handler) = &self.0.on_disconnect {
