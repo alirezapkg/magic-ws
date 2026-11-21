@@ -48,6 +48,10 @@ pub enum Error {
     /// A room was already at capacity when a user tried to join it.
     #[error(transparent)]
     RoomFull(#[from] crate::hub::JoinError),
+
+    /// An event name is not valid (e.g. contains non-ASCII characters).
+    #[error("invalid event name: {0}")]
+    InvalidName(String),
 }
 
 impl Error {

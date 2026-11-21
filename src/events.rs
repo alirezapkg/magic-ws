@@ -43,6 +43,11 @@ impl ServerEvents {
     where
         F: Fn(&User, &[u8]) + Send + Sync + 'static,
     {
+        debug_assert!(
+            event.name().is_ascii(),
+            "event name must be ASCII: {:?}",
+            event.name()
+        );
         let mut handlers = self.handlers.write().unwrap();
         handlers.insert(event.id(), Arc::new(handler));
     }
@@ -125,6 +130,11 @@ impl ClientEvents {
     where
         F: Fn(&[u8]) + Send + Sync + 'static,
     {
+        debug_assert!(
+            event.name().is_ascii(),
+            "event name must be ASCII: {:?}",
+            event.name()
+        );
         let mut handlers = self.handlers.write().unwrap();
         handlers.insert(event.id(), Arc::new(handler));
     }

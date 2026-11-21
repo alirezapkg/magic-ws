@@ -91,6 +91,23 @@ impl Event {
         }
     }
 
+    /// Creates a new event identifier, checking that `name` is ASCII.
+    ///
+    /// Non-ASCII names hash differently on Rust and Unity (Rust hashes bytes,
+    /// Unity hashes UTF-16 chars), so they are rejected here. [`Event::new`]
+    /// stays `const` and unchanged for the common ASCII case (INF-21).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::InvalidName`] when `name` contains non-ASCII
+    /// characters.
+    pub fn new_checked(name: &'static str) -> crate::Result<Self> {
+        if !name.is_ascii() {
+            return Err(crate::Error::InvalidName(name.to_string()));
+        }
+        Ok(Self::new(name))
+    }
+
     /// Builds an event from an explicit id and name.
     ///
     /// Useful when interoperating with a peer that assigned its own ids.
@@ -138,6 +155,17 @@ mod tests {
         assert_eq!(fnv1a(b"a"), 0xe40c_292c);
         // `0xbf9cf968` is the FNV-1a 32-bit hash of `b"foobar"`.
         assert_eq!(fnv1a(b"foobar"), 0xbf9c_f968);
+    }
+
+    #[test]
+    fn new_checked_rejects_non_ascii() {
+        // ASCII names are accepted and match `Event::new`.
+        let ok = Event::new_checked("player_move").expect("ascii is fine");
+        assert_eq!(ok.id(), Event::new("player_move").id());
+
+        // Non-ASCII names are rejected (INF-21).
+        let err = Event::new_checked("سلام").unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidName(_)));
     }
 
     #[test]
