@@ -546,6 +546,52 @@ async fn tls_listener_rejects_invalid_pem() {
 }
 
 #[tokio::test]
+async fn metrics_counters_increase() {
+    let (server, addr) = spawn_server(|builder| {
+        builder.on_event(ECHO, |user, payload| {
+            user.send_event(ECHO, payload);
+        })
+    })
+    .await;
+
+    let client = Client::connect(&format!("ws://{addr}/ws")).await.unwrap();
+
+    let mut deadline = 50;
+    while server.user_count() == 0 && deadline > 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        deadline -= 1;
+    }
+
+    // Send a few messages and let the echo come back.
+    let events = client.events();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    events.on(ECHO, move |_payload| {
+        let _ = tx.send(());
+    });
+    for _ in 0..5 {
+        client.emit(ECHO, b"ping");
+    }
+    for _ in 0..5 {
+        let _ = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+    }
+
+    let m = server.metrics();
+    assert!(
+        m.messages_received >= 5,
+        "received >= 5: {}",
+        m.messages_received
+    );
+    assert!(m.messages_sent >= 5, "sent >= 5: {}", m.messages_sent);
+    assert!(m.bytes_received > 0);
+    assert!(m.bytes_sent > 0);
+    assert!(m.connections >= 1);
+    assert!(m.users >= 1);
+
+    client.close().await;
+    server.shutdown();
+}
+
+#[tokio::test]
 async fn rate_limit_drops_overflow() {
     use magic_ws::{RateLimit, ViolationPolicy};
 

@@ -170,10 +170,23 @@ pub(crate) struct Inner {
     /// Close code and reason requested by the application. The writer task
     /// reads this when it finishes.
     close_code: Mutex<Option<(u16, String)>>,
+    /// Shared dropped-message counter (INF-16).
+    dropped: Arc<AtomicU64>,
 }
 
 impl User {
+    #[cfg(test)]
     pub(crate) fn new(id: String, addr: std::net::SocketAddr, tx: mpsc::Sender<Vec<u8>>) -> Self {
+        Self::new_with_dropped(id, addr, tx, Arc::new(AtomicU64::new(0)))
+    }
+
+    /// Like [`User::new`] but shares the process-wide dropped-message counter.
+    pub(crate) fn new_with_dropped(
+        id: String,
+        addr: std::net::SocketAddr,
+        tx: mpsc::Sender<Vec<u8>>,
+        dropped: Arc<AtomicU64>,
+    ) -> Self {
         let (closed_tx, _) = watch::channel(false);
         Self {
             inner: Arc::new(Inner {
@@ -194,6 +207,7 @@ impl User {
                 bucket: Mutex::new(TokenBucket::new(0)),
                 violations: AtomicU32::new(0),
                 close_code: Mutex::new(None),
+                dropped,
             }),
         }
     }
@@ -389,6 +403,7 @@ impl User {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => {
                 tracing::trace!(user = %self.inner.id, "send queue full, dropping packet");
+                self.inner.dropped.fetch_add(1, Ordering::AcqRel);
                 Err(SendError::QueueFull)
             }
             Err(TrySendError::Closed(_)) => Err(SendError::Closed),

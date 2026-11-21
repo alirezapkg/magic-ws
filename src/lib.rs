@@ -82,7 +82,7 @@ pub use protocol::{
 pub use server::TlsConfig;
 pub use server::{
     accept_key, ConnectHandler, DisconnectHandler, HeartbeatConfig, RateLimit, Server,
-    ServerBuilder, ShutdownHandler, ShutdownSignal, ViolationPolicy,
+    ServerBuilder, ServerMetrics, ShutdownHandler, ShutdownSignal, ViolationPolicy,
 };
 pub use user::{SendError, User, UserState};
 

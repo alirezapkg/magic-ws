@@ -20,7 +20,7 @@
 //! ```
 
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -83,6 +83,29 @@ pub struct HeartbeatConfig {
     pub timeout: Duration,
     /// Unused compatibility field; the watchdog uses `timeout` alone.
     pub max_missed: u32,
+}
+
+/// Snapshot of server counters (INF-16).
+///
+/// All counters are monotonic and cheap to read (atomic loads).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ServerMetrics {
+    /// Connections accepted since the server started.
+    pub connections: u64,
+    /// Currently connected users.
+    pub users: usize,
+    /// Active rooms.
+    pub rooms: usize,
+    /// Total payload bytes sent to clients.
+    pub bytes_sent: u64,
+    /// Total payload bytes received from clients.
+    pub bytes_received: u64,
+    /// Total messages sent to clients.
+    pub messages_sent: u64,
+    /// Total messages received from clients.
+    pub messages_received: u64,
+    /// Messages dropped because the outbound queue was full.
+    pub dropped: u64,
 }
 
 impl Default for HeartbeatConfig {
@@ -428,6 +451,12 @@ impl ServerBuilder {
             shutdown: watch::channel(false).0,
             tasks: Mutex::new(Vec::new()),
             on_shutdown: parking_lot::Mutex::new(Vec::new()),
+            total_connections: AtomicU64::new(0),
+            bytes_sent: AtomicU64::new(0),
+            bytes_received: AtomicU64::new(0),
+            messages_sent: AtomicU64::new(0),
+            messages_received: AtomicU64::new(0),
+            dropped: Arc::new(AtomicU64::new(0)),
         }))
     }
 }
@@ -455,6 +484,13 @@ struct ServerInner {
     tasks: Mutex<Vec<JoinHandle<()>>>,
     /// Callbacks run once after a graceful shutdown.
     on_shutdown: parking_lot::Mutex<Vec<ShutdownHandler>>,
+    // --- metrics (INF-16) ---
+    total_connections: AtomicU64,
+    bytes_sent: AtomicU64,
+    bytes_received: AtomicU64,
+    messages_sent: AtomicU64,
+    messages_received: AtomicU64,
+    dropped: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for Server {
@@ -509,6 +545,21 @@ impl Server {
     #[must_use]
     pub fn user_count(&self) -> usize {
         self.0.users.len()
+    }
+
+    /// Returns a cheap snapshot of the server counters (INF-16).
+    #[must_use]
+    pub fn metrics(&self) -> ServerMetrics {
+        ServerMetrics {
+            connections: self.0.total_connections.load(Ordering::Acquire),
+            users: self.0.users.len(),
+            rooms: self.0.users.room_count(),
+            bytes_sent: self.0.bytes_sent.load(Ordering::Acquire),
+            bytes_received: self.0.bytes_received.load(Ordering::Acquire),
+            messages_sent: self.0.messages_sent.load(Ordering::Acquire),
+            messages_received: self.0.messages_received.load(Ordering::Acquire),
+            dropped: self.0.dropped.load(Ordering::Acquire),
+        }
     }
 
     /// Returns a future that resolves once [`Server::shutdown`] is called.
@@ -865,6 +916,7 @@ impl Server {
     {
         let mut connection = connection;
         self.0.connections.fetch_add(1, Ordering::AcqRel);
+        self.0.total_connections.fetch_add(1, Ordering::AcqRel);
         let guard = ConnectionGuard(Arc::clone(&self.0));
 
         // --- version handshake ------------------------------------------------
@@ -887,7 +939,7 @@ impl Server {
         }
 
         let (tx, rx) = mpsc::channel(self.0.max_queue);
-        let user = User::new(addr.to_string(), addr, tx);
+        let user = User::new_with_dropped(addr.to_string(), addr, tx, Arc::clone(&self.0.dropped));
         user.set_state(UserState::Connected);
         if let Some(limit) = self.0.rate_limit {
             user.set_rate_limit(limit);
@@ -902,7 +954,13 @@ impl Server {
         // that carries both binary payloads and control frames.
         let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel::<Message>();
         let (sink, mut stream) = connection.split();
-        let writer = tokio::spawn(writer_task(sink, rx, ctrl_rx, user.clone()));
+        let writer = tokio::spawn(writer_task(
+            sink,
+            rx,
+            ctrl_rx,
+            user.clone(),
+            Arc::clone(&self.0),
+        ));
 
         // Heartbeat: ping periodically and reap users that stop answering.
         let heartbeat_task = self.0.heartbeat.and_then(|hb| {
@@ -926,6 +984,10 @@ impl Server {
             let Some(item) = next else { break };
             match item {
                 Ok(Message::Binary(data)) => {
+                    self.0.messages_received.fetch_add(1, Ordering::AcqRel);
+                    self.0
+                        .bytes_received
+                        .fetch_add(data.len() as u64, Ordering::AcqRel);
                     // Rate limit applies to application messages only; control
                     // frames are exempt.
                     if !user.check_rate_limit() {
@@ -1029,6 +1091,7 @@ async fn writer_task<S>(
     mut rx: mpsc::Receiver<Vec<u8>>,
     mut ctrl: mpsc::UnboundedReceiver<Message>,
     user: User,
+    inner: Arc<ServerInner>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -1040,6 +1103,10 @@ async fn writer_task<S>(
         for _ in 0..WRITE_BATCH {
             match rx.try_recv() {
                 Ok(message) => {
+                    inner.messages_sent.fetch_add(1, Ordering::AcqRel);
+                    inner
+                        .bytes_sent
+                        .fetch_add(message.len() as u64, Ordering::AcqRel);
                     if sink.feed(Message::Binary(message)).await.is_err() {
                         return finish_with_user(&mut sink, &user).await;
                     }
@@ -1071,6 +1138,8 @@ async fn writer_task<S>(
             msg = rx.recv() => {
                 match msg {
                     Some(message) => {
+                        inner.messages_sent.fetch_add(1, Ordering::AcqRel);
+                        inner.bytes_sent.fetch_add(message.len() as u64, Ordering::AcqRel);
                         if sink.send(Message::Binary(message)).await.is_err() {
                             break;
                         }
