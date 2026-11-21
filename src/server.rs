@@ -266,6 +266,9 @@ pub struct ServerBuilder {
     max_queue: Option<usize>,
     heartbeat: Option<HeartbeatConfig>,
     rate_limit: Option<RateLimit>,
+    on_room_join: Option<crate::hub::RoomJoinHandler>,
+    on_room_leave: Option<crate::hub::RoomLeaveHandler>,
+    on_room_empty: Option<crate::hub::RoomEmptyHandler>,
 }
 
 impl std::fmt::Debug for ServerBuilder {
@@ -367,11 +370,51 @@ impl ServerBuilder {
         self
     }
 
+    /// Registers a callback fired after a user joins a room (INF-14).
+    #[must_use]
+    pub fn on_room_join<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&User, RoomId) + Send + Sync + 'static,
+    {
+        self.on_room_join = Some(Arc::new(f));
+        self
+    }
+
+    /// Registers a callback fired after a user leaves a room (INF-14).
+    #[must_use]
+    pub fn on_room_leave<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&User, RoomId) + Send + Sync + 'static,
+    {
+        self.on_room_leave = Some(Arc::new(f));
+        self
+    }
+
+    /// Registers a callback fired once a room becomes empty (INF-14).
+    #[must_use]
+    pub fn on_room_empty<F>(mut self, f: F) -> Self
+    where
+        F: Fn(RoomId) + Send + Sync + 'static,
+    {
+        self.on_room_empty = Some(Arc::new(f));
+        self
+    }
+
     /// Builds the server.
     #[must_use]
     pub fn build(self) -> Server {
+        let users = UserManager::new();
+        if let Some(hook) = self.on_room_join {
+            users.inner.on_room_join.write().unwrap().push(hook);
+        }
+        if let Some(hook) = self.on_room_leave {
+            users.inner.on_room_leave.write().unwrap().push(hook);
+        }
+        if let Some(hook) = self.on_room_empty {
+            users.inner.on_room_empty.write().unwrap().push(hook);
+        }
         Server(Arc::new(ServerInner {
-            users: UserManager::new(),
+            users,
             on_connect: self.on_connect,
             on_disconnect: self.on_disconnect,
             on_message: self.on_message,

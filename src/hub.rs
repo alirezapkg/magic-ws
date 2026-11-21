@@ -2,23 +2,33 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, RwLock};
 
 use crate::user::User;
 use crate::RoomId;
+
+/// Callback fired after a user is added to a room.
+pub type RoomJoinHandler = Arc<dyn Fn(&User, RoomId) + Send + Sync + 'static>;
+
+/// Callback fired after a user is removed from a room.
+pub type RoomLeaveHandler = Arc<dyn Fn(&User, RoomId) + Send + Sync + 'static>;
+
+/// Callback fired once when a room becomes empty.
+pub type RoomEmptyHandler = Arc<dyn Fn(RoomId) + Send + Sync + 'static>;
 
 /// Tracks every connected user and their room membership.
 ///
 /// The registry is cheap to clone and safe to share across tasks.
 #[derive(Debug, Clone)]
 pub struct UserManager {
-    inner: Arc<HubInner>,
+    pub(crate) inner: Arc<HubInner>,
 }
 
 /// Shared state of the registry.
 ///
 /// `pub(crate)` so [`User::set_room`] can keep the room index in sync.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct HubInner {
     pub(crate) users: RwLock<HashMap<String, User>>,
     /// Secondary index keyed by the application-assigned player id. Only users
@@ -31,6 +41,22 @@ pub(crate) struct HubInner {
     /// tasks cannot both observe `cap - 1` and both join. Joins are infrequent,
     /// so a single global mutex is fine.
     pub(crate) room_lock: parking_lot::Mutex<()>,
+    /// Room lifecycle hooks (INF-14).
+    pub(crate) on_room_join: RwLock<Vec<RoomJoinHandler>>,
+    pub(crate) on_room_leave: RwLock<Vec<RoomLeaveHandler>>,
+    pub(crate) on_room_empty: RwLock<Vec<RoomEmptyHandler>>,
+}
+
+impl std::fmt::Debug for HubInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HubInner")
+            .field("users", &self.users.read().unwrap().len())
+            .field("rooms", &self.rooms.read().unwrap().len())
+            .field("on_room_join", &self.on_room_join.read().unwrap().len())
+            .field("on_room_leave", &self.on_room_leave.read().unwrap().len())
+            .field("on_room_empty", &self.on_room_empty.read().unwrap().len())
+            .finish()
+    }
 }
 
 impl HubInner {
@@ -53,27 +79,67 @@ impl HubInner {
         user.store_room(room);
 
         if let Some(room_id) = room {
-            self.rooms
-                .write()
-                .unwrap()
-                .entry(room_id)
-                .or_default()
-                .push_back(user.clone());
+            let was_empty = {
+                let mut rooms = self.rooms.write().unwrap();
+                let queue = rooms.entry(room_id).or_default();
+                let was_empty = queue.is_empty();
+                queue.push_back(user.clone());
+                was_empty
+            };
+            // `on_room_join` fires after the user is added.
+            self.run_join_hooks(user, room_id);
+            let _ = was_empty;
         }
     }
 
     /// Drops `user` out of `room`'s queue.
     pub(crate) fn remove_from_room(&self, user: &User, room: RoomId) {
-        let mut rooms = self.rooms.write().unwrap();
-        let Entry::Occupied(mut entry) = rooms.entry(room) else {
-            return;
+        let (removed, became_empty) = {
+            let mut rooms = self.rooms.write().unwrap();
+            let Entry::Occupied(mut entry) = rooms.entry(room) else {
+                return;
+            };
+            let queue = entry.get_mut();
+            let mut removed = false;
+            if let Some(pos) = queue.iter().position(|u| u.id() == user.id()) {
+                queue.remove(pos);
+                removed = true;
+            }
+            let became_empty = queue.is_empty();
+            if became_empty {
+                entry.remove();
+            }
+            (removed, became_empty)
         };
-        let queue = entry.get_mut();
-        if let Some(pos) = queue.iter().position(|u| u.id() == user.id()) {
-            queue.remove(pos);
+        if !removed {
+            return;
         }
-        if queue.is_empty() {
-            entry.remove();
+        // `on_room_leave` fires after removal.
+        self.run_leave_hooks(user, room);
+        // `on_room_empty` fires once when the queue becomes empty.
+        if became_empty {
+            self.run_empty_hooks(room);
+        }
+    }
+
+    fn run_join_hooks(&self, user: &User, room: RoomId) {
+        let hooks: Vec<RoomJoinHandler> = self.on_room_join.read().unwrap().clone();
+        for hook in hooks {
+            let _ = catch_unwind(AssertUnwindSafe(|| hook(user, room)));
+        }
+    }
+
+    fn run_leave_hooks(&self, user: &User, room: RoomId) {
+        let hooks: Vec<RoomLeaveHandler> = self.on_room_leave.read().unwrap().clone();
+        for hook in hooks {
+            let _ = catch_unwind(AssertUnwindSafe(|| hook(user, room)));
+        }
+    }
+
+    fn run_empty_hooks(&self, room: RoomId) {
+        let hooks: Vec<RoomEmptyHandler> = self.on_room_empty.read().unwrap().clone();
+        for hook in hooks {
+            let _ = catch_unwind(AssertUnwindSafe(|| hook(room)));
         }
     }
 
@@ -376,6 +442,83 @@ mod tests {
         assert!(manager.is_empty());
         assert!(user.is_closed());
         assert!(manager.remove("a").is_none());
+    }
+
+    #[test]
+    fn room_hooks_fire_in_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let joins = Arc::new(AtomicUsize::new(0));
+        let leaves = Arc::new(AtomicUsize::new(0));
+        let empties = Arc::new(AtomicUsize::new(0));
+
+        let j = Arc::clone(&joins);
+        let l = Arc::clone(&leaves);
+        let e = Arc::clone(&empties);
+
+        let manager = UserManager::new();
+        manager
+            .inner
+            .on_room_join
+            .write()
+            .unwrap()
+            .push(Arc::new(move |_u, _r| {
+                j.fetch_add(1, Ordering::SeqCst);
+            }));
+        manager
+            .inner
+            .on_room_leave
+            .write()
+            .unwrap()
+            .push(Arc::new(move |_u, _r| {
+                l.fetch_add(1, Ordering::SeqCst);
+            }));
+        manager
+            .inner
+            .on_room_empty
+            .write()
+            .unwrap()
+            .push(Arc::new(move |_r| {
+                e.fetch_add(1, Ordering::SeqCst);
+            }));
+
+        let a = manager.add(connected("a"));
+        let b = manager.add(connected("b"));
+
+        manager.set_user_room(&a, Some(1));
+        assert_eq!(joins.load(Ordering::SeqCst), 1, "a joined room 1");
+        assert_eq!(leaves.load(Ordering::SeqCst), 0);
+        assert_eq!(empties.load(Ordering::SeqCst), 0);
+
+        manager.set_user_room(&b, Some(1));
+        assert_eq!(joins.load(Ordering::SeqCst), 2, "b joined room 1");
+        assert_eq!(empties.load(Ordering::SeqCst), 0, "not empty yet");
+
+        // Move a out -> leave fired, not empty.
+        manager.set_user_room(&a, None);
+        assert_eq!(leaves.load(Ordering::SeqCst), 1, "a left room 1");
+        assert_eq!(empties.load(Ordering::SeqCst), 0, "b still in room 1");
+
+        // Remove b -> leave + empty fired.
+        manager.remove(b.id());
+        assert_eq!(leaves.load(Ordering::SeqCst), 2, "b left room 1");
+        assert_eq!(empties.load(Ordering::SeqCst), 1, "room 1 became empty");
+    }
+
+    #[test]
+    fn room_hooks_survive_panics() {
+        let manager = UserManager::new();
+        manager
+            .inner
+            .on_room_join
+            .write()
+            .unwrap()
+            .push(Arc::new(|_u, _r| panic!("boom")));
+
+        let a = manager.add(connected("a"));
+        // The panic is caught; the user is still in the room.
+        manager.set_user_room(&a, Some(1));
+        assert_eq!(manager.room_len(1), 1);
     }
 
     #[test]
