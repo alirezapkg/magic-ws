@@ -419,6 +419,20 @@ impl User {
         self.try_send(data).is_ok()
     }
 
+    /// Queues several messages in order (INF-25).
+    ///
+    /// Returns the number of messages that were queued. Messages after a
+    /// failure are still attempted; each is reported independently.
+    pub fn send_batch(&self, messages: Vec<Vec<u8>>) -> usize {
+        let mut queued = 0;
+        for msg in messages {
+            if self.try_send(msg).is_ok() {
+                queued += 1;
+            }
+        }
+        queued
+    }
+
     /// Queues an already encoded MagicWS message for this event.
     pub fn send_event(&self, event: crate::Event, payload: &[u8]) -> bool {
         self.send(crate::pack_message(event.id(), payload))
@@ -586,6 +600,27 @@ mod tests {
         assert!(rx.try_recv().is_ok());
         u.close();
         assert_eq!(u.try_send(vec![2]), Err(SendError::Closed));
+    }
+
+    #[tokio::test]
+    async fn send_batch_returns_queued_count() {
+        let (u, mut rx) = user();
+        u.set_state(UserState::Connected);
+
+        let msgs = vec![vec![1u8], vec![2u8], vec![3u8]];
+        assert_eq!(u.send_batch(msgs), 3);
+
+        // All three are queued in order.
+        assert_eq!(rx.try_recv().unwrap(), vec![1u8]);
+        assert_eq!(rx.try_recv().unwrap(), vec![2u8]);
+        assert_eq!(rx.try_recv().unwrap(), vec![3u8]);
+
+        // Fill the queue, then batch returns fewer than requested.
+        for _ in 0..1000 {
+            let _ = u.try_send(vec![0u8; 8]);
+        }
+        let queued = u.send_batch(vec![vec![9u8], vec![9u8]]);
+        assert_eq!(queued, 0, "queue is full, nothing queued");
     }
 
     #[test]

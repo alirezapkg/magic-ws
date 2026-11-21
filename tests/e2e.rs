@@ -661,6 +661,38 @@ async fn ban_ip_disconnects_and_blocks() {
 }
 
 #[tokio::test]
+async fn broadcast_if_only_hits_matching_users() {
+    let (server, addr) = spawn_server(|builder| builder).await;
+
+    let c1 = Client::connect(&format!("ws://{addr}/ws")).await.unwrap();
+    let c2 = Client::connect(&format!("ws://{addr}/ws")).await.unwrap();
+
+    let mut deadline = 50;
+    while server.user_count() < 2 && deadline > 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        deadline -= 1;
+    }
+    assert_eq!(server.user_count(), 2);
+
+    // Broadcast to exactly one user (the first in the registry).
+    let users = server.users().users();
+    assert_eq!(users.len(), 2);
+    let target_id = users[0].id().to_string();
+
+    let msg = magic_ws::pack_message(ECHO.id(), b"hi");
+    let sent = server.broadcast_if(|u| u.id() == target_id, &msg);
+    assert_eq!(sent, 1, "only one user matched");
+
+    // A predicate that matches nobody sends to nobody.
+    let sent_none = server.broadcast_if(|_| false, &msg);
+    assert_eq!(sent_none, 0, "predicate matching nobody sends nothing");
+
+    c1.close().await;
+    c2.close().await;
+    server.shutdown();
+}
+
+#[tokio::test]
 async fn rate_limit_drops_overflow() {
     use magic_ws::{RateLimit, ViolationPolicy};
 

@@ -933,6 +933,25 @@ impl Server {
         self.0.users.broadcast(msg)
     }
 
+    /// Broadcasts `msg` to every connected user matching `f` (INF-25).
+    ///
+    /// Returns the number of users the message was queued for.
+    pub fn broadcast_if<F>(&self, f: F, msg: &[u8]) -> usize
+    where
+        F: Fn(&User) -> bool,
+    {
+        let mut sent = 0;
+        for user in self.0.users.users() {
+            if !f(&user) {
+                continue;
+            }
+            if user.send(msg.to_vec()) {
+                sent += 1;
+            }
+        }
+        sent
+    }
+
     fn at_capacity(&self) -> bool {
         // `0` means unlimited, matching the spec for INF-12.
         self.0
