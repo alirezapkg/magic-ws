@@ -26,6 +26,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, Stream, StreamExt};
+use http::Response as HttpResponse;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch, Mutex};
@@ -34,7 +35,7 @@ use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
-use tokio_tungstenite::{accept_async_with_config, WebSocketStream};
+use tokio_tungstenite::{accept_async_with_config, accept_hdr_async, WebSocketStream};
 
 #[cfg(feature = "tls")]
 use tokio_rustls::rustls::ServerConfig;
@@ -293,6 +294,7 @@ pub struct ServerBuilder {
     on_room_leave: Option<crate::hub::RoomLeaveHandler>,
     on_room_empty: Option<crate::hub::RoomEmptyHandler>,
     max_connections_per_ip: Option<usize>,
+    allowed_origins: Option<Vec<String>>,
 }
 
 impl std::fmt::Debug for ServerBuilder {
@@ -433,6 +435,21 @@ impl ServerBuilder {
         self
     }
 
+    /// Sets the allowed `Origin` headers for incoming connections (INF-26).
+    ///
+    /// When empty, all origins are allowed (backward compatible). When
+    /// non-empty, only requests whose `Origin` header is in the list are
+    /// upgraded; others are rejected before the WebSocket handshake.
+    #[must_use]
+    pub fn allowed_origins<I, S>(mut self, origins: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.allowed_origins = Some(origins.into_iter().map(Into::into).collect());
+        self
+    }
+
     /// Builds the server.
     #[must_use]
     pub fn build(self) -> Server {
@@ -470,6 +487,7 @@ impl ServerBuilder {
             max_connections_per_ip: self.max_connections_per_ip,
             ip_connections: parking_lot::Mutex::new(std::collections::HashMap::new()),
             banned_ips: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            allowed_origins: self.allowed_origins,
         }))
     }
 }
@@ -508,6 +526,7 @@ struct ServerInner {
     max_connections_per_ip: Option<usize>,
     ip_connections: parking_lot::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>,
     banned_ips: parking_lot::Mutex<std::collections::HashSet<std::net::IpAddr>>,
+    allowed_origins: Option<Vec<String>>,
 }
 
 impl std::fmt::Debug for Server {
@@ -996,8 +1015,51 @@ impl Server {
         }
     }
 
+    #[allow(clippy::result_large_err)] // tungstenite callback returns Response by value
     async fn accept(&self, stream: TcpStream, addr: std::net::SocketAddr) -> Result<()> {
-        self.accept_stream(stream, addr).await
+        // INF-26: reject clients whose Origin is not in the allow-list. The
+        // check happens during the WebSocket handshake via `accept_hdr_async`,
+        // so the stream is consumed exactly once and no deadlock occurs.
+        let origins = self.0.allowed_origins.clone();
+        let this = self.clone();
+        let socket = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            accept_hdr_async(stream, move |req: &tokio_tungstenite::tungstenite::handshake::server::Request, resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                if let Some(origins) = origins.as_ref() {
+                    if !origins.is_empty() {
+                        let allowed = req
+                            .headers()
+                            .get("Origin")
+                            .and_then(|h| h.to_str().ok())
+                            .map(|origin| origins.iter().any(|o| o == origin))
+                            .unwrap_or(true);
+                        if !allowed {
+                            tracing::warn!(%addr, "connection rejected: disallowed origin");
+                            return Err(HttpResponse::builder()
+                                .status(403)
+                                .body(Some("Forbidden".into()))
+                                .unwrap());
+                        }
+                    }
+                }
+                Ok(resp)
+            }),
+        )
+        .await;
+        match socket {
+            Ok(Ok(socket)) => {
+                let conn = Connection { socket };
+                this.run(conn, addr).await
+            }
+            Ok(Err(err)) => {
+                tracing::debug!(%addr, %err, "handshake rejected");
+                Err(Error::Upgrade(Box::new(err)))
+            }
+            Err(_) => {
+                tracing::warn!(%addr, "handshake timeout");
+                Err(Error::InvalidAddress("handshake timeout".into()))
+            }
+        }
     }
 
     /// Accepts an already-established stream (plain TCP or TLS).

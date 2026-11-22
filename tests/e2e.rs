@@ -693,6 +693,108 @@ async fn broadcast_if_only_hits_matching_users() {
 }
 
 #[tokio::test]
+async fn allowed_origins_rejects_disallowed() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::Message;
+
+    // Server only allows the "https://good.example" origin.
+    let (server, addr) = spawn_server(|builder| {
+        builder
+            .allowed_origins(["https://good.example"])
+            .on_event(ECHO, |user, payload| {
+                user.send_event(ECHO, payload);
+            })
+    })
+    .await;
+
+    // --- Disallowed origin → rejected with 403 ---
+    let mut bad_req = format!("ws://{addr}/ws")
+        .parse::<http::Uri>()
+        .unwrap()
+        .into_client_request()
+        .unwrap();
+    bad_req
+        .headers_mut()
+        .insert("Origin", "https://evil.example".parse().unwrap());
+    let bad_result = tokio_tungstenite::client_async(
+        bad_req,
+        tokio::net::TcpStream::connect(addr).await.unwrap(),
+    )
+    .await;
+    assert!(
+        bad_result.is_err(),
+        "disallowed origin should be rejected, got: {:?}",
+        bad_result
+    );
+
+    // --- Allowed origin → handshake succeeds ---
+    let mut good_req = format!("ws://{addr}/ws")
+        .parse::<http::Uri>()
+        .unwrap()
+        .into_client_request()
+        .unwrap();
+    good_req
+        .headers_mut()
+        .insert("Origin", "https://good.example".parse().unwrap());
+    let good = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_tungstenite::client_async(
+            good_req,
+            tokio::net::TcpStream::connect(addr).await.unwrap(),
+        ),
+    )
+    .await
+    .expect("good origin should not timeout")
+    .expect("good origin should succeed");
+
+    // Verify the connection works by sending the version packet and an echo.
+    let (mut socket, _) = good;
+    socket
+        .send(Message::Binary(vec![magic_ws::PROTOCOL_VERSION]))
+        .await
+        .unwrap();
+
+    // Wait for the user to be registered.
+    let mut deadline = 50;
+    while server.user_count() == 0 && deadline > 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        deadline -= 1;
+    }
+    assert_eq!(server.user_count(), 1, "user should be registered");
+
+    // Send an echo message and expect it back.
+    let echo_msg = magic_ws::pack_message(ECHO.id(), b"origin-ok");
+    socket.send(Message::Binary(echo_msg)).await.unwrap();
+
+    let reply = tokio::time::timeout(Duration::from_secs(3), socket.next())
+        .await
+        .expect("echo reply should arrive")
+        .expect("stream alive")
+        .expect("message is Ok");
+    if let Message::Binary(data) = reply {
+        let (_, payload) = magic_ws::unpack_message(&data).expect("valid frame");
+        assert_eq!(payload, b"origin-ok");
+    } else {
+        panic!("expected binary message, got: {reply:?}");
+    }
+
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn empty_allowed_origins_allows_all() {
+    // An empty allow-list is backward compatible: any origin is accepted.
+    let (server, addr) =
+        spawn_server(|builder| builder.allowed_origins(Vec::<String>::new())).await;
+
+    let client = Client::connect(&format!("ws://{addr}/ws")).await;
+    assert!(client.is_ok(), "empty allow-list allows all origins");
+
+    server.shutdown();
+}
+
+#[tokio::test]
 async fn rate_limit_drops_overflow() {
     use magic_ws::{RateLimit, ViolationPolicy};
 
