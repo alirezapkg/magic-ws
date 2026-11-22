@@ -52,11 +52,12 @@ use crate::{Event, RoomId, UserState};
 pub use crate::user::{RateLimit, ViolationPolicy};
 
 /// WebSocket configuration applied to every accepted connection.
-pub(crate) fn ws_config() -> WebSocketConfig {
+pub(crate) fn ws_config(max_message_size: Option<usize>) -> WebSocketConfig {
+    let size = max_message_size.unwrap_or(16 << 20);
     WebSocketConfig {
         write_buffer_size: WRITE_BUF_SIZE,
-        max_message_size: Some(16 << 20),
-        max_frame_size: Some(16 << 20),
+        max_message_size: Some(size),
+        max_frame_size: Some(size),
         accept_unmasked_frames: false,
         ..WebSocketConfig::default()
     }
@@ -295,6 +296,7 @@ pub struct ServerBuilder {
     on_room_empty: Option<crate::hub::RoomEmptyHandler>,
     max_connections_per_ip: Option<usize>,
     allowed_origins: Option<Vec<String>>,
+    max_message_size: Option<usize>,
 }
 
 impl std::fmt::Debug for ServerBuilder {
@@ -450,6 +452,17 @@ impl ServerBuilder {
         self
     }
 
+    /// Sets the maximum WebSocket message size in bytes (INF-27).
+    ///
+    /// Messages larger than this are rejected by the WebSocket layer. The
+    /// default is 16 MiB. This value is applied to both `max_message_size`
+    /// and `max_frame_size` in the underlying `WebSocketConfig`.
+    #[must_use]
+    pub fn max_message_size(mut self, bytes: usize) -> Self {
+        self.max_message_size = Some(bytes);
+        self
+    }
+
     /// Builds the server.
     #[must_use]
     pub fn build(self) -> Server {
@@ -488,6 +501,7 @@ impl ServerBuilder {
             ip_connections: parking_lot::Mutex::new(std::collections::HashMap::new()),
             banned_ips: parking_lot::Mutex::new(std::collections::HashSet::new()),
             allowed_origins: self.allowed_origins,
+            max_message_size: self.max_message_size,
         }))
     }
 }
@@ -527,6 +541,7 @@ struct ServerInner {
     ip_connections: parking_lot::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>,
     banned_ips: parking_lot::Mutex<std::collections::HashSet<std::net::IpAddr>>,
     allowed_origins: Option<Vec<String>>,
+    max_message_size: Option<usize>,
 }
 
 impl std::fmt::Debug for Server {
@@ -1074,7 +1089,7 @@ impl Server {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let socket = accept_async_with_config(stream, Some(ws_config()))
+        let socket = accept_async_with_config(stream, Some(ws_config(self.0.max_message_size)))
             .await
             .map_err(Error::upgrade)?;
 

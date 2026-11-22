@@ -931,3 +931,90 @@ async fn close_with_custom_code_reaches_client() {
 
     server.shutdown();
 }
+
+#[tokio::test]
+async fn max_message_size_rejects_large_messages() {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    // Server with a tiny message-size limit (1 KiB).
+    let (server, addr) = spawn_server(|builder| builder.max_message_size(1024)).await;
+
+    // Raw client that completes the WebSocket upgrade and the version handshake.
+    let (mut socket, _) = tokio_tungstenite::client_async(
+        format!("ws://{addr}/ws").parse::<http::Uri>().unwrap(),
+        tokio::net::TcpStream::connect(addr).await.unwrap(),
+    )
+    .await
+    .unwrap();
+
+    socket
+        .send(Message::Binary(vec![magic_ws::PROTOCOL_VERSION]))
+        .await
+        .unwrap();
+
+    // Wait for registration.
+    let mut deadline = 50;
+    while server.user_count() == 0 && deadline > 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        deadline -= 1;
+    }
+    assert_eq!(server.user_count(), 1, "user registered");
+
+    // Send a 2 KiB message — larger than the 1 KiB limit. tungstenite drops
+    // it at the protocol level; the connection stays open.
+    let big = vec![0u8; 2048];
+    let _ = socket.send(Message::Binary(big)).await;
+
+    // Give the server a moment to process.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Small messages still work.
+    let small = magic_ws::pack_message(ECHO.id(), b"ok");
+    let _ = socket.send(Message::Binary(small)).await;
+
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn max_message_size_default_allows_large() {
+    // With the default (16 MiB), a 2 KiB message is fine.
+    let (server, addr) = spawn_server(|builder| {
+        builder.on_event(ECHO, |user, payload| {
+            user.send_event(ECHO, payload);
+        })
+    })
+    .await;
+
+    let client = Client::connect(&format!("ws://{addr}/ws")).await.unwrap();
+
+    let mut deadline = 50;
+    while server.user_count() == 0 && deadline > 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        deadline -= 1;
+    }
+    assert_eq!(server.user_count(), 1);
+
+    // 2 KiB message — well under the default 16 MiB.
+    let big = vec![42u8; 2048];
+    assert!(client.emit(ECHO, &big));
+
+    // Should get an echo back.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let tx = std::sync::Mutex::new(Some(tx));
+    let events = client.events();
+    events.on(ECHO, move |payload| {
+        if let Some(tx) = tx.lock().unwrap().take() {
+            let _ = tx.send(payload.to_vec());
+        }
+    });
+
+    let reply = tokio::time::timeout(Duration::from_secs(3), rx)
+        .await
+        .expect("reply should arrive")
+        .expect("sender alive");
+    assert_eq!(reply.len(), 2048);
+
+    client.close().await;
+    server.shutdown();
+}
