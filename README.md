@@ -45,7 +45,7 @@ Or add it by hand:
 
 ```toml
 [dependencies]
-magic-ws = "1.2"
+magic-ws = "1.3"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -290,6 +290,36 @@ server.on_event(CHAT, |user, _payload| {
     // user.reject("banned");             // 1008 policy violation
 });
 ```
+
+### Allowed origins
+
+Restrict which browser origins may connect (useful for WebGL clients):
+
+```rust
+use magic_ws::Server;
+
+let server = Server::builder()
+    .allowed_origins(["https://mygame.example"])
+    .build();
+```
+
+When the list is empty (the default), all origins are allowed. When non-empty,
+requests whose `Origin` header is not in the list are rejected with HTTP 403
+before the WebSocket upgrade.
+
+### Message size limit
+
+Cap the maximum WebSocket message size to protect against oversized frames:
+
+```rust
+use magic_ws::Server;
+
+let server = Server::builder()
+    .max_message_size(1024 * 1024)  // 1 MiB
+    .build();
+```
+
+Defaults to 16 MiB. Applies to both `max_message_size` and `max_frame_size`.
 
 ### Sending without a room
 
